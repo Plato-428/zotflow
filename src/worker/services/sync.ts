@@ -588,6 +588,41 @@ export class SyncService {
                                     case "updated":
                                     case "deleted":
                                     case "conflict":
+                                        if (
+                                            localItem.syncStatus === "updated" &&
+                                            this.isMetadataOnlyLocalChange(
+                                                localItem,
+                                                newItem,
+                                            )
+                                        ) {
+                                            const resolution =
+                                                this.resolveMetadataByTimestamp(
+                                                    localItem,
+                                                    newItem,
+                                                );
+
+                                            if (resolution === "keep-local") {
+                                                await this.keepLocalMetadataEdit(
+                                                    libraryID,
+                                                    localItem,
+                                                    newItem,
+                                                );
+                                                return;
+                                            }
+                                            if (resolution === "accept-remote") {
+                                                const cleanItem = normalizeItem(
+                                                    newItem,
+                                                    libraryID,
+                                                );
+                                                cleanItem.syncStatus = "synced";
+                                                await db.items.put(cleanItem);
+                                                changedItems?.push({
+                                                    libraryID,
+                                                    itemKey: cleanItem.key,
+                                                });
+                                                return;
+                                            }
+                                        }
                                         await db.items.update(
                                             [libraryID, localItem.key],
                                             {
@@ -1141,6 +1176,93 @@ export class SyncService {
         }
 
         return { retryNeeded: false };
+    }
+
+    /**
+     * True when the only local/remote divergence is in tracked "safe" fields
+     * (abstractNote, tags) — i.e. fields with their own timestamp-based
+     * last-write-wins resolution (Abstract sync, Read Status / Rating tag
+     * sync). Any other field difference is treated as a real conflict.
+     */
+    private isMetadataOnlyLocalChange(localItem: any, remoteRaw: any): boolean {
+        const localData = (localItem?.raw?.data ?? {}) as Record<string, unknown>;
+        const remoteData = (remoteRaw?.data ?? {}) as Record<string, unknown>;
+
+        const localAbstract = String(localData.abstractNote ?? "");
+        const remoteAbstract = String(remoteData.abstractNote ?? "");
+        const localTags = this.normalizeTagsForCompare(localData.tags);
+        const remoteTags = this.normalizeTagsForCompare(remoteData.tags);
+        if (localAbstract === remoteAbstract && localTags === remoteTags) {
+            return false;
+        }
+
+        const ignoredKeys = new Set([
+            "key",
+            "version",
+            "dateModified",
+            "abstractNote",
+            "tags",
+        ]);
+        const keys = new Set([
+            ...Object.keys(localData),
+            ...Object.keys(remoteData),
+        ]);
+
+        for (const key of keys) {
+            if (ignoredKeys.has(key)) continue;
+            const left = localData[key];
+            const right = remoteData[key];
+            if (JSON.stringify(left) !== JSON.stringify(right)) return false;
+        }
+        return true;
+    }
+
+    /** Order-independent comparison key for a Zotero tags array. */
+    private normalizeTagsForCompare(tags: unknown): string {
+        if (!Array.isArray(tags)) return "[]";
+        return JSON.stringify(
+            tags
+                .map((t: any) => String(t?.tag ?? ""))
+                .sort((a, b) => a.localeCompare(b)),
+        );
+    }
+
+    private resolveMetadataByTimestamp(
+        localItem: any,
+        remoteRaw: any,
+    ): "keep-local" | "accept-remote" | "conflict" {
+        const localTs = this.parseTimestamp(localItem?.dateModified);
+        const remoteTs = this.parseTimestamp(remoteRaw?.data?.dateModified);
+        if (localTs === null || remoteTs === null) return "conflict";
+        if (localTs > remoteTs) return "keep-local";
+        if (remoteTs > localTs) return "accept-remote";
+        return "conflict";
+    }
+
+    private async keepLocalMetadataEdit(
+        libraryID: number,
+        localItem: any,
+        remoteRaw: any,
+    ): Promise<void> {
+        const updatedRaw = structuredClone(localItem.raw);
+        updatedRaw.version = remoteRaw.version;
+        if (updatedRaw.data) {
+            updatedRaw.data.version = remoteRaw.version;
+        }
+
+        await db.items.update([libraryID, localItem.key], {
+            raw: updatedRaw,
+            version: remoteRaw.version,
+            syncStatus: "updated",
+            syncError: "",
+            serverCopyRaw: undefined,
+        });
+    }
+
+    private parseTimestamp(value: unknown): number | null {
+        if (typeof value !== "string" || value.trim() === "") return null;
+        const millis = Date.parse(value);
+        return Number.isNaN(millis) ? null : millis;
     }
 
     private chunkArray<T>(array: T[], size: number): T[][] {

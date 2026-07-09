@@ -69,14 +69,16 @@ export function ZotFlowLockExtension(
 
             const fmEnd = fm.fmEnd;
 
-            // If the library-id resolves to a library where note edits are
-            // disallowed (read-only sync mode, or API key lacks notes/write
-            // permission), reject ALL non-frontmatter edits regardless of
-            // editable-region state.
-            if (
+            // If the library-id resolves to a library where writes are
+            // disallowed entirely, reject all non-frontmatter edits.
+            const canEditMetadata =
                 fm.libraryId !== undefined &&
-                !services.libraryCache.canEditNotes(fm.libraryId)
-            ) {
+                services.libraryCache.isBidirectional(fm.libraryId) &&
+                services.libraryCache.canWrite(fm.libraryId);
+            const canEditNotes =
+                fm.libraryId !== undefined &&
+                services.libraryCache.canEditNotes(fm.libraryId);
+            if (!canEditMetadata) {
                 let allowFmOnly = true;
                 tr.changes.iterChanges((fromChange, toChange) => {
                     if (!allowFmOnly) return;
@@ -111,6 +113,12 @@ export function ZotFlowLockExtension(
                 // Check if change falls within an editable region that is unlocked
                 if (regions.length > 0) {
                     const inUnlockedRegion = regions.some((r) => {
+                        const canEditRegion =
+                            r.type === "ABSTRACT" || r.type === "TAGS"
+                                ? canEditMetadata
+                                : canEditNotes;
+                        if (!canEditRegion) return false;
+
                         // Determine if this region is currently unlocked
                         const isUnlocked = defaultLocked
                             ? unlocked.has(r.key) // default locked → toggle unlocks

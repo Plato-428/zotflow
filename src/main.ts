@@ -33,6 +33,7 @@ import { handleEditorDrop } from "ui/editor/citation-helper";
 
 import { openAttachment, openItemNote } from "utils/viewer";
 import { getLocalSidecarPath } from "utils/utils";
+import { obsidianTagToZoteroTag } from "utils/special-tags";
 import { checkFile, readTextFile, renameFile, deleteFile } from "utils/file";
 import { ActivityCenterModal } from "ui/activity-center/modal";
 import { ZoteroSearchModal } from "ui/modals/suggest";
@@ -66,6 +67,7 @@ export default class ZotFlow extends Plugin {
     customThemes: CustomReaderTheme[] = [];
     private citationSuggest: CitationSuggest;
     private sourceNoteActionElements = new WeakMap<MarkdownView, HTMLElement>();
+    private tagFieldDebouncers = new Map<string, ReturnType<typeof setTimeout>>();
 
     async onload() {
         // Load settings
@@ -421,10 +423,24 @@ export default class ZotFlow extends Plugin {
         this.registerEvent(
             this.app.workspace.on("file-menu", this.handleFileMenu.bind(this)),
         );
+
+        // Sync edits to the `read-status` / `rating` frontmatter fields
+        // (Zotero Reading List / Ethereal Style tags, split out of the
+        // generic tags list) back to Zotero as tag changes.
+        this.registerEvent(
+            this.app.metadataCache.on(
+                "changed",
+                this.handleSourceNoteMetadataChanged.bind(this),
+            ),
+        );
     }
 
     onunload() {
         services.viewStateService.flushViewStateSave();
+        for (const timer of this.tagFieldDebouncers.values()) {
+            clearTimeout(timer);
+        }
+        this.tagFieldDebouncers.clear();
         workerBridge.terminate();
         revokeBlobUrls();
     }
@@ -846,6 +862,110 @@ export default class ZotFlow extends Plugin {
                     });
             });
         }
+    }
+
+    /**
+     * Detect edits to the `read-status` / `rating` / `tags` frontmatter
+     * fields on a library source note and push them back to Zotero as tag
+     * changes (Zotero Reading List status tags, Ethereal Style star-rating
+     * tags, and generic tags respectively). Debounced per-file so rapid
+     * edits (typing, undo, etc.) coalesce into a single worker call. No-op
+     * if the values already match — the worker methods themselves are
+     * idempotent — so this is safe to run on every metadata-cache recompute
+     * (including vault startup indexing).
+     */
+    private handleSourceNoteMetadataChanged(file: TFile): void {
+        if (file.extension !== "md") return;
+
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fm = cache?.frontmatter;
+        if (!fm) return;
+
+        const zoteroKey = fm["zotero-key"];
+        const libraryID = fm["library-id"];
+        if (typeof zoteroKey !== "string" || typeof libraryID !== "number") {
+            return;
+        }
+
+        // Only act if the template actually renders these fields — avoids
+        // doing any work for notes that haven't been re-rendered yet.
+        const hasReadStatus = Object.prototype.hasOwnProperty.call(
+            fm,
+            "read-status",
+        );
+        const hasRating = Object.prototype.hasOwnProperty.call(fm, "rating");
+        const hasTags = Object.prototype.hasOwnProperty.call(fm, "tags");
+        if (!hasReadStatus && !hasRating && !hasTags) return;
+
+        const readStatus =
+            typeof fm["read-status"] === "string" ? fm["read-status"] : "";
+        const rating = typeof fm["rating"] === "string" ? fm["rating"] : "";
+
+        let tagNames: string[] = [];
+        if (hasTags) {
+            const rawTags = fm["tags"];
+            const tagList: unknown[] = Array.isArray(rawTags)
+                ? rawTags
+                : typeof rawTags === "string"
+                  ? rawTags.split(",")
+                  : [];
+            tagNames = tagList
+                .filter((t): t is string => typeof t === "string")
+                .map((t) => obsidianTagToZoteroTag(t))
+                .filter((t) => t.length > 0);
+        }
+
+        const debounceKey = file.path;
+        const existing = this.tagFieldDebouncers.get(debounceKey);
+        if (existing !== undefined) clearTimeout(existing);
+
+        const timer = setTimeout(() => {
+            this.tagFieldDebouncers.delete(debounceKey);
+
+            if (hasReadStatus) {
+                workerBridge.itemNote
+                    .updateItemReadStatus(
+                        libraryID,
+                        zoteroKey,
+                        readStatus.trim() || null,
+                    )
+                    .catch((e) => {
+                        services.logService.error(
+                            "Failed to sync read-status to Zotero",
+                            "Main",
+                            e,
+                        );
+                    });
+            }
+            if (hasRating) {
+                workerBridge.itemNote
+                    .updateItemRating(
+                        libraryID,
+                        zoteroKey,
+                        rating.trim() || null,
+                    )
+                    .catch((e) => {
+                        services.logService.error(
+                            "Failed to sync rating to Zotero",
+                            "Main",
+                            e,
+                        );
+                    });
+            }
+            if (hasTags) {
+                workerBridge.itemNote
+                    .updateItemTags(libraryID, zoteroKey, tagNames)
+                    .catch((e) => {
+                        services.logService.error(
+                            "Failed to sync tags to Zotero",
+                            "Main",
+                            e,
+                        );
+                    });
+            }
+        }, 2000);
+
+        this.tagFieldDebouncers.set(debounceKey, timer);
     }
 
     /**

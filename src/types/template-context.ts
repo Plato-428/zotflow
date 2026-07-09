@@ -49,6 +49,10 @@ export interface ItemTemplateContext {
     ISSN?: string;
 
     tags: Array<{ tag: string; type?: number }>;
+    /** Emoji extracted from a Zotero Reading List status tag (e.g. "📙"), if present. */
+    readStatus?: string;
+    /** Star string extracted from an Ethereal Style rating tag (e.g. "⭐⭐⭐"), if present. */
+    rating?: string;
 
     // Children
     attachments: AttachmentTemplateContext[];

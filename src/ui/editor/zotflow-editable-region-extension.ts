@@ -6,7 +6,9 @@ import {
     type Text,
 } from "@codemirror/state";
 import { ViewPlugin, type ViewUpdate } from "@codemirror/view";
+import { editorInfoField } from "obsidian";
 import { workerBridge } from "bridge";
+import { parseTagsLine, zoteroTagToObsidianTag } from "utils/special-tags";
 
 /* ================================================================ */
 /*  Marker Registry                                                 */
@@ -21,6 +23,12 @@ interface MarkerType {
 const MARKER_REGISTRY: MarkerType[] = [
     { begPrefix: "ZF_NOTE_BEG_", endPrefix: "ZF_NOTE_END_", type: "NOTE" },
     { begPrefix: "ZF_ANNO_BEG_", endPrefix: "ZF_ANNO_END_", type: "ANNO" },
+    {
+        begPrefix: "ZF_ABSTRACT_BEG_",
+        endPrefix: "ZF_ABSTRACT_END_",
+        type: "ABSTRACT",
+    },
+    { begPrefix: "ZF_TAGS_BEG_", endPrefix: "ZF_TAGS_END_", type: "TAGS" },
 ];
 
 /* ================================================================ */
@@ -326,7 +334,7 @@ const editableRegionSyncPlugin = ViewPlugin.fromClass(
             region: EditableRegion,
             state: EditorState,
         ) {
-            const debounceKey = `${libraryId}-${region.key}`;
+            const debounceKey = `${libraryId}-${region.type}-${region.key}`;
 
             // Clear previous timer for this region
             const existing = this.debouncers.get(debounceKey);
@@ -376,6 +384,82 @@ const editableRegionSyncPlugin = ViewPlugin.fromClass(
                         .catch(() => {
                             // Background sync — errors logged by worker
                         });
+                } else if (region.type === "ABSTRACT") {
+                    // ABSTRACT regions are rendered in blockquote format.
+                    // Strip the leading `> ` prefix before persisting.
+                    const content = state.doc.sliceString(
+                        region.from,
+                        region.to,
+                    );
+                    const stripped = content.replace(/^>[ \t]?/gm, "");
+                    workerBridge.itemNote
+                        .updateItemAbstract(libraryId, region.key, stripped)
+                        .catch(() => {
+                            // Background sync — errors logged by worker
+                        });
+
+                    // Live-patch the YAML frontmatter's `abstract` field (if
+                    // present in the user's template) so it doesn't show a
+                    // stale value until the next full note re-render, which
+                    // only happens after the edit round-trips through sync.
+                    const fileInfo = state.field(editorInfoField, false);
+                    const file = fileInfo?.file;
+                    if (file) {
+                        fileInfo.app.fileManager
+                            .processFrontMatter(file, (fm) => {
+                                if (
+                                    Object.prototype.hasOwnProperty.call(
+                                        fm,
+                                        "abstract",
+                                    )
+                                ) {
+                                    fm.abstract = stripped;
+                                }
+                            })
+                            .catch(() => {
+                                // Best-effort — ignore concurrent-write failures
+                            });
+                    }
+                } else if (region.type === "TAGS") {
+                    // TAGS region holds a comma-separated `#Tag_Name` list
+                    // (see the template's "Tags:" line). Parse back to raw
+                    // Zotero tag names and push.
+                    const content = state.doc.sliceString(
+                        region.from,
+                        region.to,
+                    );
+                    const tagNames = parseTagsLine(content);
+                    workerBridge.itemNote
+                        .updateItemTags(libraryId, region.key, tagNames)
+                        .catch(() => {
+                            // Background sync — errors logged by worker
+                        });
+
+                    // Live-patch the YAML frontmatter's `tags` array (if
+                    // present) so it doesn't show a stale value until the
+                    // next full note re-render. Rendered in the same
+                    // `#Tag_Name` form the template uses so Obsidian still
+                    // recognizes them as tags.
+                    const fileInfo = state.field(editorInfoField, false);
+                    const file = fileInfo?.file;
+                    if (file) {
+                        fileInfo.app.fileManager
+                            .processFrontMatter(file, (fm) => {
+                                if (
+                                    Object.prototype.hasOwnProperty.call(
+                                        fm,
+                                        "tags",
+                                    )
+                                ) {
+                                    fm.tags = tagNames.map((t) =>
+                                        zoteroTagToObsidianTag(t),
+                                    );
+                                }
+                            })
+                            .catch(() => {
+                                // Best-effort — ignore concurrent-write failures
+                            });
+                    }
                 }
             }, DEBOUNCE_DELAY);
 

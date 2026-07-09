@@ -29,6 +29,7 @@ import type { Html2MdOptions } from "worker/convert";
 import type { NotePathService } from "./note-path";
 import type { CitationTemplateInput } from "services/citation-service";
 import { extractYear } from "utils/date";
+import { splitSpecialTags } from "utils/special-tags";
 
 const DEFAULT_ITEM_TEMPLATE = `---
 citationKey: {{ item.citationKey | json }}
@@ -41,13 +42,19 @@ year: {{ item.year }}
 url: {{ item.url | json }}
 doi: {{ item.DOI | json }}
 tags: [{% for t in item.tags %}"#{{ t.tag | replace: " ", "\_" }}"{% unless forloop.last %}, {% endunless %}{% endfor %}]
+{%- if item.readStatus %}
+read-status: "{{ item.readStatus }}"
+{%- endif %}
+{%- if item.rating %}
+rating: "{{ item.rating }}"
+{%- endif %}
 ---
 {%- capture quote_string %}{{ newline }}> {% endcapture -%}
 {%- capture quote_string_2 %}{{ newline }}> >{% endcapture -%}
 # {{ item.title }}
 {%- if item.abstractNote -%}
 ## Abstract
-> {{ item.abstractNote | replace: newline, quote_string }}
+> {{ item.abstractNote | wrap_editable: "ABSTRACT", item.key | replace: newline, quote_string }}
 
 {%- endif -%}
 {%- if item.attachments.length > 0 -%}
@@ -582,6 +589,9 @@ export class LibraryTemplateService {
 
         const relatedItems = await this.mapToRelatedItems(data);
 
+        const { readStatus, rating, remaining: remainingTags } =
+            splitSpecialTags((data as any).tags || []);
+
         return {
             key: item.key,
             version: item.version,
@@ -616,7 +626,9 @@ export class LibraryTemplateService {
             DOI: (data as any).DOI,
             ISBN: (data as any).ISBN,
             ISSN: (data as any).ISSN,
-            tags: (data as any).tags || [],
+            tags: remainingTags,
+            readStatus,
+            rating,
         };
     }
 

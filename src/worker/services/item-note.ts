@@ -7,6 +7,12 @@ import type { IParentProxy } from "bridge/types";
 import type { ConvertService } from "./convert";
 import type { LibraryNoteService, UpdateOptions } from "./library-note";
 import type { ZotFlowSettings } from "settings/types";
+import {
+    READ_STATUS_TAGS,
+    matchReadStatusEmoji,
+    isRatingTag,
+    type TagLike,
+} from "utils/special-tags";
 
 /**
  * CRUD service for Zotero **child note items** (the note items attached to
@@ -227,6 +233,300 @@ export class ItemNoteService {
                     ),
                 );
         }
+    }
+
+    /**
+     * Update the abstract field on a top-level Zotero item.
+     * Called from the source-note editable ABSTRACT region.
+     */
+    async updateItemAbstract(
+        libraryID: number,
+        itemKey: string,
+        abstractText: string,
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemAbstract: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        // Abstract belongs to top-level bibliographic items, not child notes/
+        // annotations/attachments.
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            this.parentHost.log(
+                "warn",
+                `updateItemAbstract: item ${itemKey} is not a top-level bibliographic item`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        const updatedRaw = structuredClone(item.raw);
+        const rawData = (updatedRaw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        const nextAbstract = abstractText.trim();
+        const currentAbstract = String(rawData.abstractNote ?? "").trim();
+
+        // Avoid dirtying the record when the normalized content is unchanged.
+        if (currentAbstract === nextAbstract) return;
+
+        rawData.abstractNote = nextAbstract;
+        updatedRaw.data = rawData as unknown as typeof updatedRaw.data;
+
+        const now = new Date().toISOString();
+        rawData.dateModified = now;
+
+        await db.items.update([libraryID, itemKey], {
+            raw: updatedRaw,
+            syncStatus: item.syncStatus === "created" ? "created" : "updated",
+            dateModified: now,
+        });
+
+        this.parentHost.log(
+            "debug",
+            `Updated abstract for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Update the Zotero Reading List status tag on a top-level item.
+     * Called when the `read-status` frontmatter field is edited in Obsidian.
+     * Pass `null`/empty string to remove the status tag entirely.
+     */
+    async updateItemReadStatus(
+        libraryID: number,
+        itemKey: string,
+        newEmoji: string | null,
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemReadStatus: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            return;
+        }
+
+        const normalizedEmoji = newEmoji?.trim() || undefined;
+        if (normalizedEmoji && !READ_STATUS_TAGS[normalizedEmoji]) {
+            this.parentHost.log(
+                "warn",
+                `updateItemReadStatus: unrecognized read-status value "${normalizedEmoji}" for ${itemKey}`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        const rawData = (item.raw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        const currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
+        const currentEmoji = currentTags
+            .map((t) => matchReadStatusEmoji(t.tag))
+            .find((e) => e !== undefined);
+
+        // No-op if the derived status already matches (avoids marking the
+        // item dirty on every startup metadata-cache scan).
+        if ((currentEmoji ?? undefined) === normalizedEmoji) return;
+
+        const nextTags = currentTags.filter(
+            (t) => matchReadStatusEmoji(t.tag) === undefined,
+        );
+        if (normalizedEmoji) {
+            nextTags.push({ tag: READ_STATUS_TAGS[normalizedEmoji]! });
+        }
+
+        await this.applyTagUpdate(libraryID, itemKey, item, nextTags);
+
+        this.parentHost.log(
+            "debug",
+            `Updated read-status for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Update the Ethereal Style star-rating tag on a top-level item.
+     * Called when the `rating` frontmatter field is edited in Obsidian.
+     * Pass `null`/empty string to remove the rating tag entirely.
+     */
+    async updateItemRating(
+        libraryID: number,
+        itemKey: string,
+        newStars: string | null,
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemRating: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            return;
+        }
+
+        const normalizedStars = newStars?.trim() || undefined;
+        if (normalizedStars && !isRatingTag(normalizedStars)) {
+            this.parentHost.log(
+                "warn",
+                `updateItemRating: unrecognized rating value "${normalizedStars}" for ${itemKey}`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        const rawData = (item.raw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        const currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
+        const currentStars = currentTags
+            .map((t) => t.tag)
+            .find((tag) => isRatingTag(tag));
+
+        if ((currentStars ?? undefined) === normalizedStars) return;
+
+        const nextTags = currentTags.filter((t) => !isRatingTag(t.tag));
+        if (normalizedStars) {
+            nextTags.push({ tag: normalizedStars });
+        }
+
+        await this.applyTagUpdate(libraryID, itemKey, item, nextTags);
+
+        this.parentHost.log(
+            "debug",
+            `Updated rating for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Replace the generic (non read-status, non-rating) tag set on a
+     * top-level item. Called when the `tags` frontmatter field is edited in
+     * Obsidian. Read-status and rating tags are preserved untouched — those
+     * are managed separately via updateItemReadStatus/updateItemRating.
+     */
+    async updateItemTags(
+        libraryID: number,
+        itemKey: string,
+        newTagNames: string[],
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemTags: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            return;
+        }
+
+        const rawData = (item.raw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        const currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
+
+        // Preserve read-status/rating tags — they're managed by their own
+        // dedicated update methods and rendered as separate frontmatter
+        // fields, not part of the generic `tags:` list.
+        const preserved = currentTags.filter(
+            (t) =>
+                matchReadStatusEmoji(t.tag) !== undefined ||
+                isRatingTag(t.tag),
+        );
+        const currentRemaining = currentTags.filter(
+            (t) =>
+                matchReadStatusEmoji(t.tag) === undefined &&
+                !isRatingTag(t.tag),
+        );
+
+        const normalizedNew = Array.from(
+            new Set(
+                newTagNames.map((t) => t.trim()).filter((t) => t.length > 0),
+            ),
+        );
+        const normalizedCurrent = currentRemaining.map((t) => t.tag);
+
+        // No-op if the (order-independent) tag set is unchanged — avoids
+        // marking the item dirty on every startup metadata-cache scan.
+        const sortedNew = [...normalizedNew].sort();
+        const sortedCurrent = [...normalizedCurrent].sort();
+        if (JSON.stringify(sortedNew) === JSON.stringify(sortedCurrent)) {
+            return;
+        }
+
+        const nextTags: TagLike[] = [
+            ...preserved,
+            ...normalizedNew.map((tag) => ({ tag })),
+        ];
+
+        await this.applyTagUpdate(libraryID, itemKey, item, nextTags);
+
+        this.parentHost.log(
+            "debug",
+            `Updated tags for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /** Shared helper: write a new tags array back onto the item's raw data. */
+    private async applyTagUpdate(
+        libraryID: number,
+        itemKey: string,
+        item: IDBZoteroItem<any>,
+        nextTags: TagLike[],
+    ): Promise<void> {
+        const updatedRaw = structuredClone(item.raw);
+        const rawData = (updatedRaw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        rawData.tags = nextTags;
+        const now = new Date().toISOString();
+        rawData.dateModified = now;
+        updatedRaw.data = rawData as unknown as typeof updatedRaw.data;
+
+        await db.items.update([libraryID, itemKey], {
+            raw: updatedRaw,
+            syncStatus: item.syncStatus === "created" ? "created" : "updated",
+            dateModified: now,
+        });
     }
 
     /** Generate a temporary 8-character alphanumeric key for locally-created items. */
