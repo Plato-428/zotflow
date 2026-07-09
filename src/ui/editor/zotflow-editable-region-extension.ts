@@ -8,6 +8,7 @@ import {
 import { ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { editorInfoField } from "obsidian";
 import { workerBridge } from "bridge";
+import { parseTagsLine, zoteroTagToObsidianTag } from "utils/special-tags";
 
 /* ================================================================ */
 /*  Marker Registry                                                 */
@@ -27,6 +28,7 @@ const MARKER_REGISTRY: MarkerType[] = [
         endPrefix: "ZF_ABSTRACT_END_",
         type: "ABSTRACT",
     },
+    { begPrefix: "ZF_TAGS_BEG_", endPrefix: "ZF_TAGS_END_", type: "TAGS" },
 ];
 
 /* ================================================================ */
@@ -412,6 +414,46 @@ const editableRegionSyncPlugin = ViewPlugin.fromClass(
                                     )
                                 ) {
                                     fm.abstract = stripped;
+                                }
+                            })
+                            .catch(() => {
+                                // Best-effort — ignore concurrent-write failures
+                            });
+                    }
+                } else if (region.type === "TAGS") {
+                    // TAGS region holds a comma-separated `#Tag_Name` list
+                    // (see the template's "Tags:" line). Parse back to raw
+                    // Zotero tag names and push.
+                    const content = state.doc.sliceString(
+                        region.from,
+                        region.to,
+                    );
+                    const tagNames = parseTagsLine(content);
+                    workerBridge.itemNote
+                        .updateItemTags(libraryId, region.key, tagNames)
+                        .catch(() => {
+                            // Background sync — errors logged by worker
+                        });
+
+                    // Live-patch the YAML frontmatter's `tags` array (if
+                    // present) so it doesn't show a stale value until the
+                    // next full note re-render. Rendered in the same
+                    // `#Tag_Name` form the template uses so Obsidian still
+                    // recognizes them as tags.
+                    const fileInfo = state.field(editorInfoField, false);
+                    const file = fileInfo?.file;
+                    if (file) {
+                        fileInfo.app.fileManager
+                            .processFrontMatter(file, (fm) => {
+                                if (
+                                    Object.prototype.hasOwnProperty.call(
+                                        fm,
+                                        "tags",
+                                    )
+                                ) {
+                                    fm.tags = tagNames.map((t) =>
+                                        zoteroTagToObsidianTag(t),
+                                    );
                                 }
                             })
                             .catch(() => {

@@ -2112,12 +2112,14 @@
 /* ================================================================ */
 
 body.zotflow-hide-region-markers .cm-zotflow-tag-text-note,
-body.zotflow-hide-region-markers .cm-zotflow-tag-text-abstract {
+body.zotflow-hide-region-markers .cm-zotflow-tag-text-abstract,
+body.zotflow-hide-region-markers .cm-zotflow-tag-text-tags {
     display: none;
 }
 
 body.zotflow-hide-region-markers .cm-zotflow-end-line-note,
-body.zotflow-hide-region-markers .cm-zotflow-end-line-abstract {
+body.zotflow-hide-region-markers .cm-zotflow-end-line-abstract,
+body.zotflow-hide-region-markers .cm-zotflow-end-line-tags {
     display: none;
 }
 

@@ -167,8 +167,12 @@ class RegionBorderPlugin {
             height: number;
         }[] = [];
         for (const region of regions) {
-            // Only draw borders for NOTE and ABSTRACT regions
-            if (region.type !== "NOTE" && region.type !== "ABSTRACT")
+            // Only draw borders for NOTE, ABSTRACT, and TAGS regions
+            if (
+                region.type !== "NOTE" &&
+                region.type !== "ABSTRACT" &&
+                region.type !== "TAGS"
+            )
                 continue;
 
             const topBlock = this.view.lineBlockAt(region.begFrom);
@@ -285,7 +289,7 @@ export function ZotFlowRegionDecorationExtension(
                     });
                     // Unlock icon widget after BEG marker text
                     const lockDisabled =
-                        region.type === "ABSTRACT"
+                        region.type === "ABSTRACT" || region.type === "TAGS"
                             ? !canEditMetadata
                             : !canEditNotes;
                     const regionUnlocked = isDefaultLocked()

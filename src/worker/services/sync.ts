@@ -590,19 +590,19 @@ export class SyncService {
                                     case "conflict":
                                         if (
                                             localItem.syncStatus === "updated" &&
-                                            this.isAbstractOnlyLocalChange(
+                                            this.isMetadataOnlyLocalChange(
                                                 localItem,
                                                 newItem,
                                             )
                                         ) {
                                             const resolution =
-                                                this.resolveAbstractByTimestamp(
+                                                this.resolveMetadataByTimestamp(
                                                     localItem,
                                                     newItem,
                                                 );
 
                                             if (resolution === "keep-local") {
-                                                await this.keepLocalAbstractEdit(
+                                                await this.keepLocalMetadataEdit(
                                                     libraryID,
                                                     localItem,
                                                     newItem,
@@ -1178,25 +1178,38 @@ export class SyncService {
         return { retryNeeded: false };
     }
 
-    private isAbstractOnlyLocalChange(
-        localItem: any,
-        remoteRaw: any,
-    ): boolean {
+    /**
+     * True when the only local/remote divergence is in tracked "safe" fields
+     * (abstractNote, tags) — i.e. fields with their own timestamp-based
+     * last-write-wins resolution (Abstract sync, Read Status / Rating tag
+     * sync). Any other field difference is treated as a real conflict.
+     */
+    private isMetadataOnlyLocalChange(localItem: any, remoteRaw: any): boolean {
         const localData = (localItem?.raw?.data ?? {}) as Record<string, unknown>;
         const remoteData = (remoteRaw?.data ?? {}) as Record<string, unknown>;
 
         const localAbstract = String(localData.abstractNote ?? "");
         const remoteAbstract = String(remoteData.abstractNote ?? "");
-        if (localAbstract === remoteAbstract) return false;
+        const localTags = this.normalizeTagsForCompare(localData.tags);
+        const remoteTags = this.normalizeTagsForCompare(remoteData.tags);
+        if (localAbstract === remoteAbstract && localTags === remoteTags) {
+            return false;
+        }
 
-        const ignoredKeys = new Set(["key", "version", "dateModified"]);
+        const ignoredKeys = new Set([
+            "key",
+            "version",
+            "dateModified",
+            "abstractNote",
+            "tags",
+        ]);
         const keys = new Set([
             ...Object.keys(localData),
             ...Object.keys(remoteData),
         ]);
 
         for (const key of keys) {
-            if (key === "abstractNote" || ignoredKeys.has(key)) continue;
+            if (ignoredKeys.has(key)) continue;
             const left = localData[key];
             const right = remoteData[key];
             if (JSON.stringify(left) !== JSON.stringify(right)) return false;
@@ -1204,7 +1217,17 @@ export class SyncService {
         return true;
     }
 
-    private resolveAbstractByTimestamp(
+    /** Order-independent comparison key for a Zotero tags array. */
+    private normalizeTagsForCompare(tags: unknown): string {
+        if (!Array.isArray(tags)) return "[]";
+        return JSON.stringify(
+            tags
+                .map((t: any) => String(t?.tag ?? ""))
+                .sort((a, b) => a.localeCompare(b)),
+        );
+    }
+
+    private resolveMetadataByTimestamp(
         localItem: any,
         remoteRaw: any,
     ): "keep-local" | "accept-remote" | "conflict" {
@@ -1216,7 +1239,7 @@ export class SyncService {
         return "conflict";
     }
 
-    private async keepLocalAbstractEdit(
+    private async keepLocalMetadataEdit(
         libraryID: number,
         localItem: any,
         remoteRaw: any,

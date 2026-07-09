@@ -114,7 +114,7 @@ export function ZotFlowLockExtension(
                 if (regions.length > 0) {
                     const inUnlockedRegion = regions.some((r) => {
                         const canEditRegion =
-                            r.type === "ABSTRACT"
+                            r.type === "ABSTRACT" || r.type === "TAGS"
                                 ? canEditMetadata
                                 : canEditNotes;
                         if (!canEditRegion) return false;
