@@ -2111,11 +2111,13 @@
 /*  Editable Region Markers                                         */
 /* ================================================================ */
 
-body.zotflow-hide-region-markers .cm-zotflow-tag-text-note {
+body.zotflow-hide-region-markers .cm-zotflow-tag-text-note,
+body.zotflow-hide-region-markers .cm-zotflow-tag-text-abstract {
     display: none;
 }
 
-body.zotflow-hide-region-markers .cm-zotflow-end-line-note {
+body.zotflow-hide-region-markers .cm-zotflow-end-line-note,
+body.zotflow-hide-region-markers .cm-zotflow-end-line-abstract {
     display: none;
 }
 

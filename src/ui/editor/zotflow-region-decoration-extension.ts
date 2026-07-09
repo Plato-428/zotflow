@@ -167,8 +167,9 @@ class RegionBorderPlugin {
             height: number;
         }[] = [];
         for (const region of regions) {
-            // Only draw borders for NOTE regions
-            if (region.type !== "NOTE") continue;
+            // Only draw borders for NOTE and ABSTRACT regions
+            if (region.type !== "NOTE" && region.type !== "ABSTRACT")
+                continue;
 
             const topBlock = this.view.lineBlockAt(region.begFrom);
             const bottomBlock = this.view.lineBlockAt(region.endTo);
@@ -249,8 +250,11 @@ export function ZotFlowRegionDecorationExtension(
                     state.field(unlockedRegionsField, false) ??
                     new Set<string>();
 
-                const lockDisabled =
-                    !services.libraryCache.canEditNotes(libraryId);
+                const canEditMetadata =
+                    services.libraryCache.isBidirectional(libraryId) &&
+                    services.libraryCache.canWrite(libraryId);
+                const canEditNotes =
+                    services.libraryCache.canEditNotes(libraryId);
 
                 const ranges: {
                     from: number;
@@ -280,6 +284,10 @@ export function ZotFlowRegionDecorationExtension(
                         }),
                     });
                     // Unlock icon widget after BEG marker text
+                    const lockDisabled =
+                        region.type === "ABSTRACT"
+                            ? !canEditMetadata
+                            : !canEditNotes;
                     const regionUnlocked = isDefaultLocked()
                         ? unlocked.has(region.key) // default locked → toggle set = unlocked keys
                         : !unlocked.has(region.key); // default unlocked → toggle set = locked keys

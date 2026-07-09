@@ -229,6 +229,71 @@ export class ItemNoteService {
         }
     }
 
+    /**
+     * Update the abstract field on a top-level Zotero item.
+     * Called from the source-note editable ABSTRACT region.
+     */
+    async updateItemAbstract(
+        libraryID: number,
+        itemKey: string,
+        abstractText: string,
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemAbstract: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        // Abstract belongs to top-level bibliographic items, not child notes/
+        // annotations/attachments.
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            this.parentHost.log(
+                "warn",
+                `updateItemAbstract: item ${itemKey} is not a top-level bibliographic item`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        const updatedRaw = structuredClone(item.raw);
+        const rawData = (updatedRaw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        const nextAbstract = abstractText.trim();
+        const currentAbstract = String(rawData.abstractNote ?? "").trim();
+
+        // Avoid dirtying the record when the normalized content is unchanged.
+        if (currentAbstract === nextAbstract) return;
+
+        rawData.abstractNote = nextAbstract;
+        updatedRaw.data = rawData as unknown as typeof updatedRaw.data;
+
+        const now = new Date().toISOString();
+        rawData.dateModified = now;
+
+        await db.items.update([libraryID, itemKey], {
+            raw: updatedRaw,
+            syncStatus: item.syncStatus === "created" ? "created" : "updated",
+            dateModified: now,
+        });
+
+        this.parentHost.log(
+            "debug",
+            `Updated abstract for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
     /** Generate a temporary 8-character alphanumeric key for locally-created items. */
     private generateTempKey(): string {
         let len = 8;

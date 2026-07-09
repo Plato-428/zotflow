@@ -588,6 +588,41 @@ export class SyncService {
                                     case "updated":
                                     case "deleted":
                                     case "conflict":
+                                        if (
+                                            localItem.syncStatus === "updated" &&
+                                            this.isAbstractOnlyLocalChange(
+                                                localItem,
+                                                newItem,
+                                            )
+                                        ) {
+                                            const resolution =
+                                                this.resolveAbstractByTimestamp(
+                                                    localItem,
+                                                    newItem,
+                                                );
+
+                                            if (resolution === "keep-local") {
+                                                await this.keepLocalAbstractEdit(
+                                                    libraryID,
+                                                    localItem,
+                                                    newItem,
+                                                );
+                                                return;
+                                            }
+                                            if (resolution === "accept-remote") {
+                                                const cleanItem = normalizeItem(
+                                                    newItem,
+                                                    libraryID,
+                                                );
+                                                cleanItem.syncStatus = "synced";
+                                                await db.items.put(cleanItem);
+                                                changedItems?.push({
+                                                    libraryID,
+                                                    itemKey: cleanItem.key,
+                                                });
+                                                return;
+                                            }
+                                        }
                                         await db.items.update(
                                             [libraryID, localItem.key],
                                             {
@@ -1141,6 +1176,70 @@ export class SyncService {
         }
 
         return { retryNeeded: false };
+    }
+
+    private isAbstractOnlyLocalChange(
+        localItem: any,
+        remoteRaw: any,
+    ): boolean {
+        const localData = (localItem?.raw?.data ?? {}) as Record<string, unknown>;
+        const remoteData = (remoteRaw?.data ?? {}) as Record<string, unknown>;
+
+        const localAbstract = String(localData.abstractNote ?? "");
+        const remoteAbstract = String(remoteData.abstractNote ?? "");
+        if (localAbstract === remoteAbstract) return false;
+
+        const ignoredKeys = new Set(["key", "version", "dateModified"]);
+        const keys = new Set([
+            ...Object.keys(localData),
+            ...Object.keys(remoteData),
+        ]);
+
+        for (const key of keys) {
+            if (key === "abstractNote" || ignoredKeys.has(key)) continue;
+            const left = localData[key];
+            const right = remoteData[key];
+            if (JSON.stringify(left) !== JSON.stringify(right)) return false;
+        }
+        return true;
+    }
+
+    private resolveAbstractByTimestamp(
+        localItem: any,
+        remoteRaw: any,
+    ): "keep-local" | "accept-remote" | "conflict" {
+        const localTs = this.parseTimestamp(localItem?.dateModified);
+        const remoteTs = this.parseTimestamp(remoteRaw?.data?.dateModified);
+        if (localTs === null || remoteTs === null) return "conflict";
+        if (localTs > remoteTs) return "keep-local";
+        if (remoteTs > localTs) return "accept-remote";
+        return "conflict";
+    }
+
+    private async keepLocalAbstractEdit(
+        libraryID: number,
+        localItem: any,
+        remoteRaw: any,
+    ): Promise<void> {
+        const updatedRaw = structuredClone(localItem.raw);
+        updatedRaw.version = remoteRaw.version;
+        if (updatedRaw.data) {
+            updatedRaw.data.version = remoteRaw.version;
+        }
+
+        await db.items.update([libraryID, localItem.key], {
+            raw: updatedRaw,
+            version: remoteRaw.version,
+            syncStatus: "updated",
+            syncError: "",
+            serverCopyRaw: undefined,
+        });
+    }
+
+    private parseTimestamp(value: unknown): number | null {
+        if (typeof value !== "string" || value.trim() === "") return null;
+        const millis = Date.parse(value);
+        return Number.isNaN(millis) ? null : millis;
     }
 
     private chunkArray<T>(array: T[], size: number): T[][] {

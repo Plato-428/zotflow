@@ -47,7 +47,7 @@ tags: [{% for t in item.tags %}"#{{ t.tag | replace: " ", "\_" }}"{% unless forl
 # {{ item.title }}
 {%- if item.abstractNote -%}
 ## Abstract
-> {{ item.abstractNote | replace: newline, quote_string }}
+> {{ item.abstractNote | wrap_editable: "ABSTRACT", item.key | replace: newline, quote_string }}
 
 {%- endif -%}
 {%- if item.attachments.length > 0 -%}
