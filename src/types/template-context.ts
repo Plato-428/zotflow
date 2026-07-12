@@ -34,6 +34,8 @@ export interface ItemTemplateContext {
     accessDate?: string;
     abstractNote?: string;
     publicationTitle?: string;
+    /** Parent book's title (Zotero `bookTitle` field, used by `bookSection` items). */
+    bookTitle?: string;
     publisher?: string;
     place?: string;
     volume?: string;

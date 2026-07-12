@@ -68,6 +68,27 @@ export default class ZotFlow extends Plugin {
     private citationSuggest: CitationSuggest;
     private sourceNoteActionElements = new WeakMap<MarkdownView, HTMLElement>();
     private tagFieldDebouncers = new Map<string, ReturnType<typeof setTimeout>>();
+    /**
+     * Last-observed value of each watched frontmatter field per file path.
+     * `metadataCache.on("changed")` fires on ANY file edit (not just
+     * frontmatter edits) since Obsidian recomputes the whole file's cache
+     * on every change — including edits to the body (e.g. typing in the
+     * editable Abstract/Tags region). Without this snapshot, a body edit
+     * would be misread as a frontmatter change (since the cache still
+     * carries the stale, pre-patch frontmatter value at that point),
+     * triggering a spurious push that clobbers the in-progress body edit.
+     * Only fields whose value actually differs from the last snapshot are
+     * treated as real edits.
+     */
+    private lastFrontmatterSnapshot = new Map<
+        string,
+        {
+            readStatus?: string;
+            rating?: string;
+            tagsKey?: string;
+            abstract?: string;
+        }
+    >();
 
     async onload() {
         // Load settings
@@ -865,14 +886,14 @@ export default class ZotFlow extends Plugin {
     }
 
     /**
-     * Detect edits to the `read-status` / `rating` / `tags` frontmatter
-     * fields on a library source note and push them back to Zotero as tag
-     * changes (Zotero Reading List status tags, Ethereal Style star-rating
-     * tags, and generic tags respectively). Debounced per-file so rapid
-     * edits (typing, undo, etc.) coalesce into a single worker call. No-op
-     * if the values already match — the worker methods themselves are
-     * idempotent — so this is safe to run on every metadata-cache recompute
-     * (including vault startup indexing).
+     * Detect edits to the `read-status` / `rating` / `tags` / `abstract`
+     * frontmatter fields on a library source note and push them back to
+     * Zotero (tag changes for read-status/rating/tags, item field update
+     * for abstract). Debounced per-file so rapid edits (typing, undo, etc.)
+     * coalesce into a single worker call. No-op if the values already
+     * match — the worker methods themselves are idempotent — so this is
+     * safe to run on every metadata-cache recompute (including vault
+     * startup indexing).
      */
     private handleSourceNoteMetadataChanged(file: TFile): void {
         if (file.extension !== "md") return;
@@ -895,11 +916,17 @@ export default class ZotFlow extends Plugin {
         );
         const hasRating = Object.prototype.hasOwnProperty.call(fm, "rating");
         const hasTags = Object.prototype.hasOwnProperty.call(fm, "tags");
-        if (!hasReadStatus && !hasRating && !hasTags) return;
+        const hasAbstract = Object.prototype.hasOwnProperty.call(
+            fm,
+            "abstract",
+        );
+        if (!hasReadStatus && !hasRating && !hasTags && !hasAbstract) return;
 
         const readStatus =
             typeof fm["read-status"] === "string" ? fm["read-status"] : "";
         const rating = typeof fm["rating"] === "string" ? fm["rating"] : "";
+        const abstractValue =
+            typeof fm["abstract"] === "string" ? fm["abstract"] : "";
 
         let tagNames: string[] = [];
         if (hasTags) {
@@ -915,6 +942,40 @@ export default class ZotFlow extends Plugin {
                 .filter((t) => t.length > 0);
         }
 
+        // Diff against the last-observed snapshot for this file so we only
+        // react to genuine frontmatter edits — not cache recomputes caused
+        // by unrelated body edits (which fire this same event without the
+        // frontmatter's actual field values having changed yet).
+        const prevSnapshot = this.lastFrontmatterSnapshot.get(file.path);
+        const tagsKey = JSON.stringify([...tagNames].sort());
+        const trimmedAbstract = abstractValue.trim();
+
+        const readStatusChanged =
+            hasReadStatus && readStatus !== (prevSnapshot?.readStatus ?? "");
+        const ratingChanged =
+            hasRating && rating !== (prevSnapshot?.rating ?? "");
+        const tagsChanged =
+            hasTags && tagsKey !== (prevSnapshot?.tagsKey ?? "[]");
+        const abstractChanged =
+            hasAbstract &&
+            trimmedAbstract !== (prevSnapshot?.abstract ?? "");
+
+        this.lastFrontmatterSnapshot.set(file.path, {
+            readStatus: hasReadStatus ? readStatus : prevSnapshot?.readStatus,
+            rating: hasRating ? rating : prevSnapshot?.rating,
+            tagsKey: hasTags ? tagsKey : prevSnapshot?.tagsKey,
+            abstract: hasAbstract ? trimmedAbstract : prevSnapshot?.abstract,
+        });
+
+        if (
+            !readStatusChanged &&
+            !ratingChanged &&
+            !tagsChanged &&
+            !abstractChanged
+        ) {
+            return;
+        }
+
         const debounceKey = file.path;
         const existing = this.tagFieldDebouncers.get(debounceKey);
         if (existing !== undefined) clearTimeout(existing);
@@ -922,7 +983,7 @@ export default class ZotFlow extends Plugin {
         const timer = setTimeout(() => {
             this.tagFieldDebouncers.delete(debounceKey);
 
-            if (hasReadStatus) {
+            if (readStatusChanged) {
                 workerBridge.itemNote
                     .updateItemReadStatus(
                         libraryID,
@@ -937,7 +998,7 @@ export default class ZotFlow extends Plugin {
                         );
                     });
             }
-            if (hasRating) {
+            if (ratingChanged) {
                 workerBridge.itemNote
                     .updateItemRating(
                         libraryID,
@@ -952,12 +1013,52 @@ export default class ZotFlow extends Plugin {
                         );
                     });
             }
-            if (hasTags) {
+            if (tagsChanged) {
                 workerBridge.itemNote
                     .updateItemTags(libraryID, zoteroKey, tagNames)
                     .catch((e) => {
                         services.logService.error(
                             "Failed to sync tags to Zotero",
+                            "Main",
+                            e,
+                        );
+                    });
+            }
+            if (abstractChanged) {
+                workerBridge.itemNote
+                    .updateItemAbstract(libraryID, zoteroKey, trimmedAbstract)
+                    .catch((e) => {
+                        services.logService.error(
+                            "Failed to sync abstract to Zotero",
+                            "Main",
+                            e,
+                        );
+                    });
+
+                // Live-patch the body's editable ABSTRACT region (if
+                // present) so it doesn't show a stale value until the next
+                // full note re-render — mirrors the reverse direction
+                // already handled by the CM6 editable-region extension
+                // (body edit -> frontmatter patch).
+                this.app.vault
+                    .process(file, (content) => {
+                        const regex = new RegExp(
+                            `(<!-- ZF_ABSTRACT_BEG_${zoteroKey} -->\\r?\\n)([\\s\\S]*?)(\\r?\\n<!-- ZF_ABSTRACT_END_${zoteroKey} -->)`,
+                        );
+                        const match = regex.exec(content);
+                        if (!match) return content;
+                        const currentBody = match[2] ?? "";
+                        if (currentBody.trim() === trimmedAbstract) {
+                            return content;
+                        }
+                        return content.replace(
+                            regex,
+                            `$1${trimmedAbstract}$3`,
+                        );
+                    })
+                    .catch((e) => {
+                        services.logService.error(
+                            "Failed to patch abstract body region",
                             "Main",
                             e,
                         );

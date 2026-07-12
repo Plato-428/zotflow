@@ -29,17 +29,33 @@ export const READ_STATUS_TAGS: Record<string, string> = {
 /** Rating tag text is 1-5 star characters and nothing else. */
 export const RATING_REGEX = /^\u2b50{1,5}$/;
 
+/**
+ * Strip Unicode variation selectors (e.g. U+FE0F, the "emoji presentation"
+ * selector) that some sources include after an emoji and others omit —
+ * without this, a tag like "\ud83d\udcd9\ufe0f To Read" (variation selector
+ * present) would fail to match against the plain "\ud83d\udcd9" key below.
+ * Also strips any literal `#` characters: some Zotero tags picked up a
+ * stray embedded `#` from earlier round-trips through Obsidian (before the
+ * tag-sync hash handling was finalized), e.g. a malformed "#\u2b50\u2b50\u2b50"
+ * tag sitting alongside the real "\u2b50\u2b50\u2b50" one. Matching should
+ * be tolerant of that so both get excluded from the generic tag list.
+ */
+function normalizeForMatch(s: string): string {
+    return s.replace(/[\ufe00-\ufe0f]/g, "").replace(/#/g, "");
+}
+
 /** Return the registered read-status emoji this tag represents, if any. */
 export function matchReadStatusEmoji(tag: string): string | undefined {
+    const normalized = normalizeForMatch(tag.trim());
     for (const emoji of Object.keys(READ_STATUS_TAGS)) {
-        if (tag.startsWith(emoji)) return emoji;
+        if (normalized.startsWith(normalizeForMatch(emoji))) return emoji;
     }
     return undefined;
 }
 
 /** True when the tag is a bare 1-5 character star-rating tag. */
 export function isRatingTag(tag: string): boolean {
-    return RATING_REGEX.test(tag);
+    return RATING_REGEX.test(normalizeForMatch(tag.trim()));
 }
 
 /**
@@ -85,8 +101,13 @@ export function parseTagsLine(line: string): string[] {
 
 /**
  * Split a Zotero tag list into { readStatus, rating, remaining }.
- * `remaining` excludes any matched read-status/rating tags so they don't
- * pollute Obsidian's generic `tags:` frontmatter field.
+ * `remaining` excludes ALL matched read-status/rating tags (not just the
+ * first) so they don't pollute Obsidian's generic `tags:` frontmatter
+ * field — Zotero items can end up with more than one such tag (e.g. a
+ * stale "New" tag left behind alongside a newer "To Read" tag, or
+ * duplicate rating tags), and every one of them must be excluded even
+ * though only the last-seen value is kept as the representative
+ * readStatus/rating for the note.
  */
 export function splitSpecialTags<T extends TagLike>(
     tags: T[] | undefined | null,
@@ -96,14 +117,12 @@ export function splitSpecialTags<T extends TagLike>(
     const remaining: T[] = [];
 
     for (const t of tags ?? []) {
-        if (readStatus === undefined) {
-            const emoji = matchReadStatusEmoji(t.tag);
-            if (emoji) {
-                readStatus = emoji;
-                continue;
-            }
+        const emoji = matchReadStatusEmoji(t.tag);
+        if (emoji) {
+            readStatus = emoji;
+            continue;
         }
-        if (rating === undefined && isRatingTag(t.tag)) {
+        if (isRatingTag(t.tag)) {
             rating = t.tag;
             continue;
         }

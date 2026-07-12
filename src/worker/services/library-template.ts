@@ -565,13 +565,21 @@ export class LibraryTemplateService {
             (att) => att.annotations,
         );
 
-        let creatorsObj: { name: string }[] = [];
+        let creatorsObj: {
+            creatorType?: string;
+            firstName?: string;
+            lastName?: string;
+            name?: string;
+        }[] = [];
         if (raw.meta?.creatorsSummary) {
             if (typeof raw.meta.creatorsSummary === "string") {
                 creatorsObj = [{ name: raw.meta.creatorsSummary }];
             }
         } else if ((data as any).creators) {
             creatorsObj = (data as any).creators.map((c: any) => ({
+                creatorType: c.creatorType,
+                firstName: c.firstName,
+                lastName: c.lastName,
                 name:
                     c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim(),
             }));
@@ -614,6 +622,7 @@ export class LibraryTemplateService {
             accessDate: (data as any).accessDate || null,
             abstractNote: (data as any).abstractNote,
             publicationTitle: (data as any).publicationTitle,
+            bookTitle: (data as any).bookTitle,
             publisher: (data as any).publisher,
             place: (data as any).place,
             volume: (data as any).volume,
