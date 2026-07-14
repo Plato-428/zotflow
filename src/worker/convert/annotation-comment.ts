@@ -31,21 +31,33 @@
 export function metaHtml2md(text: string): string {
     if (!text) return "";
     let md = text;
-    // Trim whitespace inside the tags before wrapping, so
-    // "the <i> Symposium </i> is" → "the *Symposium* is"
+    // Trim whitespace inside the tags before wrapping.
+    // If a trailing space was inside the tag (e.g. Zotero Ctrl+I captures
+    // the space after the selected word), move it outside the closing
+    // delimiter — but only when there isn't already a space there, to avoid
+    // doubling up.  Leading whitespace inside a tag is simply discarded.
     md = md.replace(
         /<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/gi,
-        (_, p1: string) => `**${p1.trim()}**`,
+        (match: string, content: string, offset: number, str: string) => {
+            const inner = content.trim();
+            const hadTrailing = /\s$/.test(content);
+            const nextChar = (str[offset + match.length] as string | undefined) ?? "";
+            const suffix = hadTrailing && nextChar !== " " ? " " : "";
+            return `**${inner}**${suffix}`;
+        },
     );
     md = md.replace(
         /<(?:i|em)>([\s\S]*?)<\/(?:i|em)>/gi,
-        (_, p1: string) => `*${p1.trim()}*`,
+        (match: string, content: string, offset: number, str: string) => {
+            const inner = content.trim();
+            const hadTrailing = /\s$/.test(content);
+            const nextChar = (str[offset + match.length] as string | undefined) ?? "";
+            const suffix = hadTrailing && nextChar !== " " ? " " : "";
+            return `*${inner}*${suffix}`;
+        },
     );
     // Strip any remaining HTML tags
     md = md.replace(/<[^>]*>/g, "");
-    // Collapse double (or more) spaces that Zotero plain-text editors
-    // sometimes add around inline HTML tags  ("the  *word*  is" → "the *word* is")
-    md = md.replace(/ {2,}/g, " ");
     return md;
 }
 
