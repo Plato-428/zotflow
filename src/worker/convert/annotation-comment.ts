@@ -31,10 +31,21 @@
 export function metaHtml2md(text: string): string {
     if (!text) return "";
     let md = text;
-    md = md.replace(/<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/gi, "**$1**");
-    md = md.replace(/<(?:i|em)>([\s\S]*?)<\/(?:i|em)>/gi, "*$1*");
+    // Trim whitespace inside the tags before wrapping, so
+    // "the <i> Symposium </i> is" → "the *Symposium* is"
+    md = md.replace(
+        /<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/gi,
+        (_, p1: string) => `**${p1.trim()}**`,
+    );
+    md = md.replace(
+        /<(?:i|em)>([\s\S]*?)<\/(?:i|em)>/gi,
+        (_, p1: string) => `*${p1.trim()}*`,
+    );
     // Strip any remaining HTML tags
     md = md.replace(/<[^>]*>/g, "");
+    // Collapse double (or more) spaces that Zotero plain-text editors
+    // sometimes add around inline HTML tags  ("the  *word*  is" → "the *word* is")
+    md = md.replace(/ {2,}/g, " ");
     return md;
 }
 
