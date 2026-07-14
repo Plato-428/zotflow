@@ -672,6 +672,57 @@ function tightenLists(tree: MRoot): void {
     });
 }
 
+/**
+ * Decode HTML character references that remark-stringify emits for
+ * otherwise-harmless characters.
+ *
+ * The most common case is trailing whitespace inside `<em>` / `<strong>`
+ * from Zotero's note editor: rehype→remark produces emphasis("Timaeus ")
+ * and remark-stringify encodes the space as `&#x20;` because a closing `*`
+ * preceded by whitespace is not a valid CommonMark delimiter.  The digit
+ * immediately following is then also encoded (e.g. `&#x35;` for "5").
+ *
+ * We decode every `&#xNN;` entity whose code point maps to a character that
+ * has no syntactic meaning in Markdown, leaving intentionally-escaped
+ * Markdown-special characters (`*`, `_`, `` ` ``, `[`, `]`, etc.) encoded.
+ */
+const MD_SPECIAL = new Set([
+    0x21, // !
+    0x22, // "
+    0x23, // #
+    0x24, // $  (math in some parsers)
+    0x26, // &
+    0x27, // '
+    0x28, // (
+    0x29, // )
+    0x2a, // *
+    0x2b, // +  (Extended MD underline)
+    0x3b, // ;  (could complete an entity)
+    0x3c, // <
+    0x3e, // >
+    0x3d, // =  (Extended MD highlight)
+    0x5b, // [
+    0x5c, // \
+    0x5d, // ]
+    0x5e, // ^  (Extended MD superscript)
+    0x5f, // _
+    0x60, // `
+    0x7b, // {
+    0x7c, // |
+    0x7d, // }
+    0x7e, // ~  (GFM strikethrough / subscript)
+]);
+
+function decodeInnocentEntities(md: string): string {
+    return md.replace(/&#x([0-9a-fA-F]+);/gi, (match, hex: string) => {
+        const cp = parseInt(hex, 16);
+        if (cp >= 0x20 && cp <= 0x7e && !MD_SPECIAL.has(cp)) {
+            return String.fromCodePoint(cp);
+        }
+        return match;
+    });
+}
+
 function protectObsidianSyntax(tree: MRoot): void {
     visitParents(
         tree as any,
@@ -828,6 +879,10 @@ export async function html2mdWithProcessors(
     protectObsidianSyntax(remark);
 
     let md = remarkToMarkdown(remark, remarkStringifier);
+
+    // Decode harmless &#xNN; entities that remark-stringify emits for
+    // characters like spaces and digits adjacent to emphasis delimiters.
+    md = decodeInnocentEntities(md);
 
     // Prepend an HTML comment with the wrapper div's metadata so md2html
     // can reconstruct the wrapper on the way back. The CM6 meta extension
