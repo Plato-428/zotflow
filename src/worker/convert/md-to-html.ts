@@ -32,6 +32,26 @@ type GenericProcessor = Processor<
 >;
 
 /* ================================================================ */
+/*  Color map — Extended MD color name → Zotero background-color   */
+/* ================================================================ */
+
+/**
+ * Maps Extended Markdown Syntax color names back to Zotero's highlight hex
+ * colors. Used when converting Obsidian markdown back to Zotero note HTML.
+ * "blue" is mapped to the same hex as "cyan" (Zotero's closest match).
+ */
+const EXT_MD_COLOR_TO_HEX: Readonly<Record<string, string>> = {
+    yellow: "#ffd400",
+    red: "#ff6666",
+    orange: "#f19837",
+    green: "#5fb236",
+    cyan: "#2ea8e5",
+    blue: "#2ea8e5",
+    purple: "#a28ae5",
+    pink: "#e56eee",
+};
+
+/* ================================================================ */
 /*  Options                                                         */
 /* ================================================================ */
 
@@ -99,6 +119,35 @@ function md2remark(
         /^(\s*[-*+]\s+)\[([ xX])\]\s+/gm,
         (_m, prefix: string, state: string) =>
             `${prefix}<span data-zf-task="${state.toLowerCase() === "x" ? "x" : "open"}"></span>`,
+    );
+
+    // Convert Extended Markdown Syntax (Obsidian "Extended Markdown Syntax"
+    // plugin) to HTML tags before remark parsing. Remark treats inline HTML
+    // tags as raw nodes and still parses the content between them for other
+    // markdown marks, so nested formatting (e.g. `++**bold**++`) round-trips
+    // correctly.
+    //
+    // Order: highlight first (most specific), then underline, super, sub.
+    // Single-tilde subscript uses a negative lookbehind/ahead to avoid
+    // interfering with GFM double-tilde strikethrough (~~text~~).
+    //
+    // Note: these replacements are not math-aware — `^` substitution could
+    // affect content inside `$...$` spans (same limitation as the footnote
+    // and task-list pre-processing above).
+    const EXT_MD_COLORS =
+        "red|orange|yellow|green|cyan|blue|purple|pink";
+    str = str.replace(
+        new RegExp(`==\\{(${EXT_MD_COLORS})\\}(.+?)==`, "g"),
+        (_m, color: string, text: string) => {
+            const hex = EXT_MD_COLOR_TO_HEX[color] ?? "#ffd400";
+            return `<span style="background-color: ${hex}">${text}</span>`;
+        },
+    );
+    str = str.replace(/\+\+(.+?)\+\+/g, (_m, t: string) => `<u>${t}</u>`);
+    str = str.replace(/\^([^^\n]+)\^/g, (_m, t: string) => `<sup>${t}</sup>`);
+    str = str.replace(
+        /(?<!~)~([^~\n]+)~(?!~)/g,
+        (_m, t: string) => `<sub>${t}</sub>`,
     );
 
     const tree = remarkParser.parse(str) as MRoot;

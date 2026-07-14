@@ -30,6 +30,7 @@ import type { NotePathService } from "./note-path";
 import type { CitationTemplateInput } from "services/citation-service";
 import { extractYear } from "utils/date";
 import { splitSpecialTags } from "utils/special-tags";
+import { metaHtml2md } from "worker/convert/annotation-comment";
 
 const DEFAULT_ITEM_TEMPLATE = `---
 citationKey: {{ item.citationKey | json }}
@@ -605,14 +606,14 @@ export class LibraryTemplateService {
             attachments,
             relatedItems,
             itemType: item.itemType,
-            title: item.title || "",
+            title: metaHtml2md(item.title || ""),
             creators: creatorsObj,
             date: (data as any).date || null,
             year: extractYear((data as any).date),
             dateAdded: item.dateAdded,
             dateModified: item.dateModified,
             accessDate: (data as any).accessDate || null,
-            abstractNote: (data as any).abstractNote,
+            abstractNote: metaHtml2md((data as any).abstractNote ?? ""),
             publicationTitle: (data as any).publicationTitle,
             publisher: (data as any).publisher,
             place: (data as any).place,

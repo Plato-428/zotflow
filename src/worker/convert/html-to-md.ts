@@ -218,6 +218,35 @@ function decodeNumericCharRefs(value: string): string {
 }
 
 /* ================================================================ */
+/*  Color maps — Zotero background-color ↔ Extended MD color name  */
+/* ================================================================ */
+
+/**
+ * Maps Zotero's highlight hex colors to Extended Markdown Syntax color names.
+ * Colors not in this map are left as raw HTML (passthrough).
+ */
+const ZOTERO_COLOR_TO_EXT_MD: Readonly<Record<string, string>> = {
+    "#ffd400": "yellow",
+    "#ff6666": "red",
+    "#f19837": "orange",
+    "#5fb236": "green",
+    "#2ea8e5": "cyan",
+    "#a28ae5": "purple",
+    "#e56eee": "pink",
+};
+
+/**
+ * Extract the `background-color` value from an inline style string and map it
+ * to an Extended MD color name. Returns `null` for unknown/missing colors.
+ */
+function extractBgColorName(style: string): string | null {
+    const m = style.match(/background-color:\s*([^;]+)/);
+    if (!m) return null;
+    const raw = m[1]!.trim().toLowerCase();
+    return ZOTERO_COLOR_TO_EXT_MD[raw] ?? null;
+}
+
+/* ================================================================ */
 /*  Phase 2 — rehype → remark  (schema-driven handler registry)    */
 /* ================================================================ */
 /*                                                                  */
@@ -250,12 +279,27 @@ function decodeNumericCharRefs(value: string): string {
 /**
  * These tell remark-stringify how to serialize our custom mdast node
  * types back to markdown text.
+ *
+ * Handlers may accept `(node, parent, state)` — remark-stringify always
+ * supplies all three; TypeScript's structural typing allows fewer declared
+ * params, so we use `any` to permit the optional extra args.
  */
-const mdastStringifyHandlers: Record<string, (node: any) => string> = {
-    /* marks serialized as HTML (no native md syntax) */
-    u: (n) => `<u>${n.value}</u>`,
-    sub: (n) => `<sub>${n.value}</sub>`,
-    sup: (n) => `<sup>${n.value}</sup>`,
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mdastStringifyHandlers: Record<string, (node: any, parent?: any, state?: any) => string> = {
+    /* Extended Markdown Syntax (Obsidian "Extended Markdown Syntax" plugin) */
+    u: (n, _p, state) =>
+        `++${state ? state.containerPhrasing(n, { before: "+", after: "+" }) : toText(n)}++`,
+    sub: (n, _p, state) =>
+        `~${state ? state.containerPhrasing(n, { before: "~", after: "~" }) : toText(n)}~`,
+    sup: (n, _p, state) =>
+        `^${state ? state.containerPhrasing(n, { before: "^", after: "^" }) : toText(n)}^`,
+    extHighlight: (n, _p, state) => {
+        const color = (n.data?.color as string | undefined) ?? "yellow";
+        const content = state
+            ? state.containerPhrasing(n, { before: "=", after: "=" })
+            : toText(n);
+        return `=={${color}}${content}==`;
+    },
 
     /* math */
     inlineMath: (n) => `$${n.value}$`,
@@ -436,7 +480,17 @@ function buildRehype2RemarkHandlers(
         }
 
         // — Zotero backgroundColor mark: <span style="background-color: …">
+        //   Map known Zotero highlight colors to Extended MD `=={color}text==`.
+        //   Unknown colors fall back to raw HTML passthrough.
         if (style.includes("background-color")) {
+            const colorName = extractBgColorName(style);
+            if (colorName) {
+                return {
+                    type: "extHighlight",
+                    data: { color: colorName },
+                    children: state.all(node),
+                } as any;
+            }
             return { type: "html", value: toHtml(node) } as any;
         }
 
@@ -494,19 +548,19 @@ function buildRehype2RemarkHandlers(
 
     /* ---- Inline Nodes — Marks (no native Markdown syntax) ------- */
 
-    // <u> (underline mark) → custom mdast "u" node → `<u>text</u>`
-    handlers.u = (_state, node) => {
-        return { type: "u", value: toText(node) } as any;
+    // <u> (underline mark) → custom mdast "u" node → `++text++`
+    handlers.u = (state, node) => {
+        return { type: "u", children: state.all(node) } as any;
     };
 
-    // <sub> → custom mdast "sub" node → `<sub>text</sub>`
-    handlers.sub = (_state, node) => {
-        return { type: "sub", value: toText(node) } as any;
+    // <sub> → custom mdast "sub" node → `~text~`
+    handlers.sub = (state, node) => {
+        return { type: "sub", children: state.all(node) } as any;
     };
 
-    // <sup> → custom mdast "sup" node → `<sup>text</sup>`
-    handlers.sup = (_state, node) => {
-        return { type: "sup", value: toText(node) } as any;
+    // <sup> → custom mdast "sup" node → `^text^`
+    handlers.sup = (state, node) => {
+        return { type: "sup", children: state.all(node) } as any;
     };
 
     // <br> handling depends on the vault's strict-line-breaks setting.
@@ -597,6 +651,124 @@ function detectTaskListItems(tree: MRoot): void {
             container.children.shift();
         }
     });
+}
+
+/**
+ * Tighten list items that rehype-remark marks as "spread" because Zotero
+ * wraps every `<li>` child in a `<p>` element.
+ *
+ * remark-stringify renders a listItem as loose (blank line after) when
+ * `spread: true`, which the default rehype→remark handler sets whenever
+ * `<li>` contains a block-level child (`<p>`). Since Zotero's note editor
+ * always uses this structure regardless of whether the user intended a tight
+ * or loose list, all lists should be treated as tight on import.
+ */
+function tightenLists(tree: MRoot): void {
+    visit(tree as any, "listItem", (node: any) => {
+        node.spread = false;
+    });
+    visit(tree as any, "list", (node: any) => {
+        node.spread = false;
+    });
+}
+
+/**
+ * Move leading/trailing whitespace out of `emphasis` and `strong` nodes so
+ * that remark-stringify does not HTML-encode them.
+ *
+ * Zotero's note editor frequently places the trailing space *inside* the
+ * closing tag — e.g. `<strong>world; </strong>` or `<em>Timaeus </em>51 B`.
+ * rehype→remark preserves this, producing e.g. strong("world; ").
+ * remark-stringify then notices the closing `**` is preceded by whitespace
+ * (which CommonMark forbids for a right-flanking delimiter) and escapes the
+ * space as `&#x20;`, which Obsidian renders literally.
+ *
+ * By moving the whitespace *outside* the node before stringifying we get
+ * `**world;** such is …` and `*Timaeus* 51 B` — valid CommonMark that
+ * renders correctly.
+ *
+ * Mutations are collected first and applied in reverse document order so
+ * earlier indices are not invalidated by insertions.
+ */
+function normalizeEmphasisWhitespace(tree: MRoot): void {
+    type Patch = { parent: any; idx: number };
+    const patches: Patch[] = [];
+
+    visitParents(
+        tree as any,
+        (n: any) => n.type === "emphasis" || n.type === "strong",
+        (node: any, ancestors: any[]) => {
+            const parent = ancestors[ancestors.length - 1];
+            if (!parent?.children) return;
+            const idx = (parent.children as any[]).indexOf(node);
+            if (idx === -1 || !node.children?.length) return;
+
+            const first = node.children[0];
+            const last = node.children[node.children.length - 1];
+            const needsLeading =
+                first?.type === "text" && /^\s/.test(first.value);
+            const needsTrailing =
+                last?.type === "text" && /\s$/.test(last.value);
+            if (needsLeading || needsTrailing) {
+                patches.push({ parent, idx });
+            }
+        },
+    );
+
+    // Reverse so that higher indices are processed first; inserting nodes
+    // after idx+N does not shift earlier indices within the same parent.
+    patches.reverse();
+
+    for (const { parent, idx } of patches) {
+        const node = parent.children[idx];
+        if (!node?.children?.length) continue;
+
+        // Strip and hoist trailing whitespace
+        const last = node.children[node.children.length - 1];
+        let trailingWs = "";
+        if (last?.type === "text") {
+            const m = /(\s+)$/.exec(last.value);
+            if (m) {
+                trailingWs = m[1]!;
+                last.value = last.value.slice(0, -trailingWs.length);
+                if (!last.value) node.children.pop();
+            }
+        }
+
+        // Strip and hoist leading whitespace
+        const first = node.children[0];
+        let leadingWs = "";
+        if (first?.type === "text") {
+            const m = /^(\s+)/.exec(first.value);
+            if (m) {
+                leadingWs = m[1]!;
+                first.value = first.value.slice(leadingWs.length);
+                if (!first.value) node.children.shift();
+            }
+        }
+
+        // Insert extracted whitespace outside the node.
+        // Insert trailing first (higher index) so leading insertion index
+        // stays correct.
+        if (trailingWs) {
+            parent.children.splice(idx + 1, 0, {
+                type: "text",
+                value: trailingWs,
+            });
+        }
+        if (leadingWs) {
+            parent.children.splice(idx, 0, {
+                type: "text",
+                value: leadingWs,
+            });
+        }
+
+        // If the node is now empty (was purely whitespace), remove it.
+        if (!node.children.length) {
+            const newIdx = (parent.children as any[]).indexOf(node);
+            if (newIdx !== -1) parent.children.splice(newIdx, 1);
+        }
+    }
 }
 
 function protectObsidianSyntax(tree: MRoot): void {
@@ -744,6 +916,18 @@ export async function html2mdWithProcessors(
     // sentinels, or hand-written) into proper mdast `listItem.checked`
     // state, so the stringifier emits canonical task-list markdown.
     detectTaskListItems(remark);
+
+    // Tighten list items: Zotero wraps <li> content in <p>, causing
+    // rehype-remark to mark every list item as "spread". Reset spread to
+    // false for items that have no genuinely multi-block content.
+    tightenLists(remark);
+
+    // Move leading/trailing whitespace out of emphasis/strong nodes.
+    // Zotero often places the trailing space inside the closing tag
+    // (e.g. <strong>world; </strong>), which causes remark-stringify to
+    // emit &#x20; because a closing ** preceded by whitespace is not a
+    // valid CommonMark right-flanking delimiter.
+    normalizeEmphasisWhitespace(remark);
 
     // Protect Obsidian-only inline syntax (e.g. [[wikilinks]]) from
     // mdast-util-to-markdown's text-node escape rules.
