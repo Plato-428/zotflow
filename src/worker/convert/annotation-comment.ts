@@ -3,24 +3,20 @@
  *
  * Annotation comments use a restricted HTML subset: `<b>`, `<i>`, `<sub>`, `<sup>`.
  * In Obsidian markdown the first two map to native syntax (`**` / `*`), while
- * `<sub>` and `<sup>` pass through as raw inline HTML (Obsidian renders them).
+ * `<sub>` and `<sup>` map to Extended Markdown Syntax (`~` / `^`) when the
+ * "Extended Markdown Syntax" plugin is active.
  *
  * These converters are intentionally simple — no AST parsing is needed for
  * four tags. They live separately from the full unified pipeline used by notes.
  */
-
-// Placeholders for <sub>/<sup> tags during escaping
-const PH_SUB_OPEN = "\x00SUB_O\x00";
-const PH_SUB_CLOSE = "\x00SUB_C\x00";
-const PH_SUP_OPEN = "\x00SUP_O\x00";
-const PH_SUP_CLOSE = "\x00SUP_C\x00";
 
 /**
  * Convert annotation comment HTML → markdown for display in source notes.
  *
  * - `<b>text</b>` → `**text**`
  * - `<i>text</i>` → `*text*`
- * - `<sub>`, `<sup>` → kept as-is (Obsidian renders inline HTML)
+ * - `<sub>text</sub>` → `~text~`  (Extended Markdown Syntax)
+ * - `<sup>text</sup>` → `^text^`  (Extended Markdown Syntax)
  * - `>` and `<` outside of preserved tags are escaped to prevent
  *   accidental blockquote / HTML injection in markdown
  * - Newlines preserved
@@ -36,21 +32,15 @@ export function annoHtml2md(html: string): string {
     // Italic: <i>...</i> → *...*
     md = md.replace(/<i>([\s\S]*?)<\/i>/gi, "*$1*");
 
-    // Protect <sub>/<sup> tags with placeholders before escaping < >
-    md = md.replace(/<sub>/gi, PH_SUB_OPEN);
-    md = md.replace(/<\/sub>/gi, PH_SUB_CLOSE);
-    md = md.replace(/<sup>/gi, PH_SUP_OPEN);
-    md = md.replace(/<\/sup>/gi, PH_SUP_CLOSE);
+    // Subscript: <sub>...</sub> → ~...~  (Extended Markdown Syntax)
+    md = md.replace(/<sub>([\s\S]*?)<\/sub>/gi, "~$1~");
+
+    // Superscript: <sup>...</sup> → ^...^  (Extended Markdown Syntax)
+    md = md.replace(/<sup>([\s\S]*?)<\/sup>/gi, "^$1^");
 
     // Escape stray < and > so they don't produce markdown syntax
     md = md.replace(/</g, "\\<");
     md = md.replace(/>/g, "\\>");
-
-    // Restore <sub>/<sup> tags
-    md = md.replace(new RegExp(PH_SUB_OPEN, "g"), "<sub>");
-    md = md.replace(new RegExp(PH_SUB_CLOSE, "g"), "</sub>");
-    md = md.replace(new RegExp(PH_SUP_OPEN, "g"), "<sup>");
-    md = md.replace(new RegExp(PH_SUP_CLOSE, "g"), "</sup>");
 
     return md;
 }
@@ -60,7 +50,8 @@ export function annoHtml2md(html: string): string {
  *
  * - `**text**` → `<b>text</b>`
  * - `*text*`   → `<i>text</i>`
- * - `<sub>`, `<sup>` → kept as-is
+ * - `~text~`   → `<sub>text</sub>`  (Extended Markdown Syntax)
+ * - `^text^`   → `<sup>text</sup>`  (Extended Markdown Syntax)
  * - Strips any other HTML tags (safety)
  */
 export function annoMd2html(md: string): string {
@@ -80,6 +71,12 @@ export function annoMd2html(md: string): string {
         /(?<!\*)\*(?!\*)([\s\S]*?)(?<!\*)\*(?!\*)/g,
         "<i>$1</i>",
     );
+
+    // Subscript: ~...~ → <sub>...</sub>  (single tilde, not double)
+    html = html.replace(/(?<!~)~([^~]+)~(?!~)/g, "<sub>$1</sub>");
+
+    // Superscript: ^...^ → <sup>...</sup>
+    html = html.replace(/\^([^^]+)\^/g, "<sup>$1</sup>");
 
     // Strip any HTML tags except the allowed subset
     html = html.replace(
