@@ -13,6 +13,7 @@ import {
     isRatingTag,
     type TagLike,
 } from "utils/special-tags";
+import { metaMd2html } from "worker/convert/annotation-comment";
 
 /**
  * CRUD service for Zotero **child note items** (the note items attached to
@@ -275,7 +276,7 @@ export class ItemNoteService {
             string,
             unknown
         >;
-        const nextAbstract = abstractText.trim();
+        const nextAbstract = metaMd2html(abstractText.trim());
         const currentAbstract = String(rawData.abstractNote ?? "").trim();
 
         // Avoid dirtying the record when the normalized content is unchanged.
