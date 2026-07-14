@@ -278,6 +278,22 @@ export default class ZotFlow extends Plugin {
         });
 
         this.addCommand({
+            id: "update-active-source-note",
+            name: "Update source note",
+            callback: async () => {
+                await this.updateActiveSourceNote(false);
+            },
+        });
+
+        this.addCommand({
+            id: "force-update-active-source-note",
+            name: "Force update source note",
+            callback: async () => {
+                await this.updateActiveSourceNote(true);
+            },
+        });
+
+        this.addCommand({
             id: "extract-all-annotation-images",
             name: "Extract all annotation images from attachments",
             callback: async () => {
@@ -728,6 +744,73 @@ export default class ZotFlow extends Plugin {
         } catch (e) {
             services.notificationService.notify("error", errorMessage);
             services.logService.error(errorMessage, "Main", e);
+        }
+    }
+
+    /**
+     * Command palette handler for "Update source note" and
+     * "Force update source note".
+     *
+     * Reads frontmatter from the currently active markdown view to determine
+     * whether it is a library source note (`zotero-key` + `library-id`) or a
+     * local source note (`zotflow-local-attachment`), then runs the same
+     * update logic as the equivalent right-click context menu items.
+     *
+     * @param force - `true` for force-update (overwrites content + images);
+     *                `false` for incremental update (skips up-to-date content).
+     */
+    private async updateActiveSourceNote(force: boolean): Promise<void> {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view?.file) {
+            services.notificationService.notify(
+                "warning",
+                "No note is currently open.",
+            );
+            return;
+        }
+
+        const file = view.file;
+        const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+        const zoteroKey = fm?.["zotero-key"];
+        const libraryID = fm?.["library-id"];
+        const localAttachment = fm?.["zotflow-local-attachment"];
+
+        if (typeof zoteroKey === "string" && typeof libraryID === "number") {
+            // Library source note
+            try {
+                await workerBridge.libraryNote.triggerUpdate(
+                    libraryID,
+                    zoteroKey,
+                    force
+                        ? { forceUpdateContent: true, forceUpdateImages: true }
+                        : {},
+                    false,
+                );
+                services.notificationService.notify(
+                    "success",
+                    force ? "Source note force-updated." : "Source note updated.",
+                );
+            } catch (e) {
+                const msg = force
+                    ? "Failed to force-update source note."
+                    : "Failed to update source note.";
+                services.notificationService.notify("error", msg);
+                services.logService.error(
+                    force
+                        ? "Failed to force-update library source note"
+                        : "Failed to update library source note",
+                    "Main",
+                    e,
+                );
+            }
+        } else if (typeof localAttachment === "string") {
+            // Local source notes always do a full re-render; force flag unused.
+            await this.updateLocalSourceNoteFromMenu(file, localAttachment);
+        } else {
+            services.notificationService.notify(
+                "warning",
+                "This is not a valid ZotFlow source note.",
+            );
         }
     }
 
