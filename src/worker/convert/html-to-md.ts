@@ -673,54 +673,102 @@ function tightenLists(tree: MRoot): void {
 }
 
 /**
- * Decode HTML character references that remark-stringify emits for
- * otherwise-harmless characters.
+ * Move leading/trailing whitespace out of `emphasis` and `strong` nodes so
+ * that remark-stringify does not HTML-encode them.
  *
- * The most common case is trailing whitespace inside `<em>` / `<strong>`
- * from Zotero's note editor: rehype→remark produces emphasis("Timaeus ")
- * and remark-stringify encodes the space as `&#x20;` because a closing `*`
- * preceded by whitespace is not a valid CommonMark delimiter.  The digit
- * immediately following is then also encoded (e.g. `&#x35;` for "5").
+ * Zotero's note editor frequently places the trailing space *inside* the
+ * closing tag — e.g. `<strong>world; </strong>` or `<em>Timaeus </em>51 B`.
+ * rehype→remark preserves this, producing e.g. strong("world; ").
+ * remark-stringify then notices the closing `**` is preceded by whitespace
+ * (which CommonMark forbids for a right-flanking delimiter) and escapes the
+ * space as `&#x20;`, which Obsidian renders literally.
  *
- * We decode every `&#xNN;` entity whose code point maps to a character that
- * has no syntactic meaning in Markdown, leaving intentionally-escaped
- * Markdown-special characters (`*`, `_`, `` ` ``, `[`, `]`, etc.) encoded.
+ * By moving the whitespace *outside* the node before stringifying we get
+ * `**world;** such is …` and `*Timaeus* 51 B` — valid CommonMark that
+ * renders correctly.
+ *
+ * Mutations are collected first and applied in reverse document order so
+ * earlier indices are not invalidated by insertions.
  */
-const MD_SPECIAL = new Set([
-    0x21, // !
-    0x22, // "
-    0x23, // #
-    0x24, // $  (math in some parsers)
-    0x26, // &
-    0x27, // '
-    0x28, // (
-    0x29, // )
-    0x2a, // *
-    0x2b, // +  (Extended MD underline)
-    0x3b, // ;  (could complete an entity)
-    0x3c, // <
-    0x3e, // >
-    0x3d, // =  (Extended MD highlight)
-    0x5b, // [
-    0x5c, // \
-    0x5d, // ]
-    0x5e, // ^  (Extended MD superscript)
-    0x5f, // _
-    0x60, // `
-    0x7b, // {
-    0x7c, // |
-    0x7d, // }
-    0x7e, // ~  (GFM strikethrough / subscript)
-]);
+function normalizeEmphasisWhitespace(tree: MRoot): void {
+    type Patch = { parent: any; idx: number };
+    const patches: Patch[] = [];
 
-function decodeInnocentEntities(md: string): string {
-    return md.replace(/&#x([0-9a-fA-F]+);/gi, (match, hex: string) => {
-        const cp = parseInt(hex, 16);
-        if (cp >= 0x20 && cp <= 0x7e && !MD_SPECIAL.has(cp)) {
-            return String.fromCodePoint(cp);
+    visitParents(
+        tree as any,
+        (n: any) => n.type === "emphasis" || n.type === "strong",
+        (node: any, ancestors: any[]) => {
+            const parent = ancestors[ancestors.length - 1];
+            if (!parent?.children) return;
+            const idx = (parent.children as any[]).indexOf(node);
+            if (idx === -1 || !node.children?.length) return;
+
+            const first = node.children[0];
+            const last = node.children[node.children.length - 1];
+            const needsLeading =
+                first?.type === "text" && /^\s/.test(first.value);
+            const needsTrailing =
+                last?.type === "text" && /\s$/.test(last.value);
+            if (needsLeading || needsTrailing) {
+                patches.push({ parent, idx });
+            }
+        },
+    );
+
+    // Reverse so that higher indices are processed first; inserting nodes
+    // after idx+N does not shift earlier indices within the same parent.
+    patches.reverse();
+
+    for (const { parent, idx } of patches) {
+        const node = parent.children[idx];
+        if (!node?.children?.length) continue;
+
+        // Strip and hoist trailing whitespace
+        const last = node.children[node.children.length - 1];
+        let trailingWs = "";
+        if (last?.type === "text") {
+            const m = /(\s+)$/.exec(last.value);
+            if (m) {
+                trailingWs = m[1]!;
+                last.value = last.value.slice(0, -trailingWs.length);
+                if (!last.value) node.children.pop();
+            }
         }
-        return match;
-    });
+
+        // Strip and hoist leading whitespace
+        const first = node.children[0];
+        let leadingWs = "";
+        if (first?.type === "text") {
+            const m = /^(\s+)/.exec(first.value);
+            if (m) {
+                leadingWs = m[1]!;
+                first.value = first.value.slice(leadingWs.length);
+                if (!first.value) node.children.shift();
+            }
+        }
+
+        // Insert extracted whitespace outside the node.
+        // Insert trailing first (higher index) so leading insertion index
+        // stays correct.
+        if (trailingWs) {
+            parent.children.splice(idx + 1, 0, {
+                type: "text",
+                value: trailingWs,
+            });
+        }
+        if (leadingWs) {
+            parent.children.splice(idx, 0, {
+                type: "text",
+                value: leadingWs,
+            });
+        }
+
+        // If the node is now empty (was purely whitespace), remove it.
+        if (!node.children.length) {
+            const newIdx = (parent.children as any[]).indexOf(node);
+            if (newIdx !== -1) parent.children.splice(newIdx, 1);
+        }
+    }
 }
 
 function protectObsidianSyntax(tree: MRoot): void {
@@ -874,15 +922,18 @@ export async function html2mdWithProcessors(
     // false for items that have no genuinely multi-block content.
     tightenLists(remark);
 
+    // Move leading/trailing whitespace out of emphasis/strong nodes.
+    // Zotero often places the trailing space inside the closing tag
+    // (e.g. <strong>world; </strong>), which causes remark-stringify to
+    // emit &#x20; because a closing ** preceded by whitespace is not a
+    // valid CommonMark right-flanking delimiter.
+    normalizeEmphasisWhitespace(remark);
+
     // Protect Obsidian-only inline syntax (e.g. [[wikilinks]]) from
     // mdast-util-to-markdown's text-node escape rules.
     protectObsidianSyntax(remark);
 
     let md = remarkToMarkdown(remark, remarkStringifier);
-
-    // Decode harmless &#xNN; entities that remark-stringify emits for
-    // characters like spaces and digits adjacent to emphasis delimiters.
-    md = decodeInnocentEntities(md);
 
     // Prepend an HTML comment with the wrapper div's metadata so md2html
     // can reconstruct the wrapper on the way back. The CM6 meta extension
