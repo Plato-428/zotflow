@@ -7,12 +7,12 @@
 
 import { visit } from "unist-util-visit";
 
-import { styleStr } from "./element";
+import { extractHighlightColor, styleStr } from "./element";
 import { PASS, stringifyAs } from "./types";
+import { extHighlight, type ExtHighlightMark, type InlineHtmlMark } from "../model/nodes";
 
 import type { Root as HRoot } from "hast";
 import type { Delete, PhrasingContent } from "mdast";
-import type { InlineHtmlMark } from "../model/nodes";
 import type { SyntaxFeature } from "./types";
 
 type InlineHtmlTag = InlineHtmlMark["type"];
@@ -44,25 +44,59 @@ export const marksFeature: SyntaxFeature = {
 
     hastHandlers: () => ({
         // Zotero's strike mark is a styled span, not <del>.
+        // Zotero's background-color highlights are also styled spans.
         span: (state, node) => {
-            if (!styleStr(node).includes("text-decoration: line-through")) {
-                return PASS;
+            const style = styleStr(node);
+            if (style.includes("text-decoration: line-through")) {
+                const del: Delete = {
+                    type: "delete",
+                    children: state.all(node) as PhrasingContent[],
+                };
+                return del;
             }
-            const del: Delete = {
-                type: "delete",
-                children: state.all(node) as PhrasingContent[],
-            };
-            return del;
+            const hlColor = extractHighlightColor(style);
+            if (hlColor !== null) {
+                return extHighlight(hlColor, state.all(node));
+            }
+            return PASS;
         },
 
+        // HTML <mark> → default yellow highlight
+        mark: (state, node) => extHighlight("yellow", state.all(node)),
+
         // <u>/<sub>/<sup> → phrasing containers of the same name.
+        // <u> serializes as Extended Markdown ++text++
         u: (state, node) => markNode("u", state.all(node)),
         sub: (state, node) => markNode("sub", state.all(node)),
         sup: (state, node) => markNode("sup", state.all(node)),
     }),
 
     stringifyHandlers: () => ({
-        u: inlineHtmlMark("u"),
+        // Underline serializes to Obsidian Extended Markdown ++text++
+        u: stringifyAs<InlineHtmlMark>((node, _parent, state, info) => {
+            const inner = state.containerPhrasing(node, {
+                ...info,
+                before: "+",
+                after: "+",
+            });
+            return `++${inner}++`;
+        }),
+
+        // Highlights serialize to Obsidian Extended Markdown =={color}text== or ==text==
+        extHighlight: stringifyAs<ExtHighlightMark>(
+            (node, _parent, state, info) => {
+                const open =
+                    node.color === "yellow" ? "==" : `=={${node.color}}`;
+                const close = "==";
+                const inner = state.containerPhrasing(node, {
+                    ...info,
+                    before: "=",
+                    after: "=",
+                });
+                return `${open}${inner}${close}`;
+            },
+        ),
+
         sub: inlineHtmlMark("sub"),
         sup: inlineHtmlMark("sup"),
     }),
@@ -73,9 +107,13 @@ export const marksFeature: SyntaxFeature = {
      */
     transformHast(tree: HRoot) {
         visit(tree, "element", (node) => {
-            if (node.tagName !== "del") return;
-            node.tagName = "span";
-            node.properties.style = "text-decoration: line-through";
+            if (node.tagName === "del") {
+                node.tagName = "span";
+                node.properties.style = "text-decoration: line-through";
+            } else if (node.tagName === "mark") {
+                node.tagName = "span";
+                node.properties.style = "background-color: #ffd400";
+            }
         });
     },
 };

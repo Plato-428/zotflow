@@ -86,6 +86,18 @@ export interface InlineHtmlMark extends Parent {
     children: PhrasingContent[];
 }
 
+/**
+ * An Extended Markdown highlight mark (`=={color}text==` or `==text==`).
+ *
+ * A phrasing container holding real `children`, allowing nested formatting
+ * (e.g. `=={yellow}**bold**==`) to survive cleanly.
+ */
+export interface ExtHighlightMark extends Parent {
+    type: "extHighlight";
+    color: string;
+    children: PhrasingContent[];
+}
+
 /*
  * `inlineMath` and `math` are declared by `mdast-util-math` (via
  * `remark-math`) and deliberately not redeclared here.
@@ -97,12 +109,14 @@ declare module "mdast" {
         zoteroAnnotationImage: ZoteroAnnotationImage;
         obsidianRaw: ObsidianRaw;
         inlineHtmlMark: InlineHtmlMark;
+        extHighlight: ExtHighlightMark;
     }
     interface RootContentMap {
         zoteroOpaqueHtml: ZoteroOpaqueHtml;
         zoteroAnnotationImage: ZoteroAnnotationImage;
         obsidianRaw: ObsidianRaw;
         inlineHtmlMark: InlineHtmlMark;
+        extHighlight: ExtHighlightMark;
     }
 }
 
@@ -119,4 +133,15 @@ export function opaqueHtml(
 
 export function obsidianRaw(value: string): ObsidianRaw {
     return { type: "obsidianRaw", value };
+}
+
+export function extHighlight(
+    color: string,
+    children: unknown,
+): ExtHighlightMark {
+    return {
+        type: "extHighlight",
+        color,
+        children: children as PhrasingContent[],
+    };
 }

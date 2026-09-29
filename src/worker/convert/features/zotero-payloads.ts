@@ -13,7 +13,7 @@
 import { toHtml } from "hast-util-to-html";
 
 import { opaqueHtml } from "../model/nodes";
-import { classNames, styleStr } from "./element";
+import { classNames, extractHighlightColor, styleStr } from "./element";
 import { PASS, safeInContainer, stringifyAs } from "./types";
 
 import type { ZoteroOpaqueHtml } from "../model/nodes";
@@ -48,7 +48,15 @@ export const zoteroPayloadFeature: SyntaxFeature = {
             }
 
             // Zotero backgroundColor / textColor marks.
+            // Known highlight colors pass through to the marks feature so they
+            // convert to Extended MD `=={color}text==`. Other colors stay opaque HTML.
             if (style.includes("background-color") || style.includes("color")) {
+                if (
+                    style.includes("background-color") &&
+                    extractHighlightColor(style) !== null
+                ) {
+                    return PASS;
+                }
                 return opaqueHtml(toHtml(node), "colored-text");
             }
 

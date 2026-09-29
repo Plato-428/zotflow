@@ -24,3 +24,42 @@ export function styleStr(node: Element): string {
     const raw = node.properties.style;
     return typeof raw === "string" ? raw : "";
 }
+
+/**
+ * Maps Zotero's highlight hex colors to Extended Markdown Syntax color names.
+ * Colors not in this map are left as raw HTML (passthrough).
+ */
+export const ZOTERO_HEX_TO_COLOR: Readonly<Record<string, string>> = {
+    "#ffd400": "yellow",
+    "#ff6666": "red",
+    "#f19837": "orange",
+    "#5fb236": "green",
+    "#2ea8e5": "cyan",
+    "#a28ae5": "purple",
+    "#e56eee": "pink",
+};
+
+/**
+ * Maps Extended Markdown color names to Zotero hex colors.
+ */
+export const COLOR_TO_ZOTERO_HEX: Readonly<Record<string, string>> = {
+    yellow: "#ffd400",
+    red: "#ff6666",
+    orange: "#f19837",
+    green: "#5fb236",
+    cyan: "#2ea8e5",
+    blue: "#2ea8e5", // alias for cyan
+    purple: "#a28ae5",
+    pink: "#e56eee",
+};
+
+/**
+ * Extract the `background-color` value from an inline style string and map it
+ * to an Extended MD color name. Returns `null` for unknown/missing colors.
+ */
+export function extractHighlightColor(style: string): string | null {
+    const m = /background-color:\s*([^;]+)/i.exec(style);
+    if (!m) return null;
+    const raw = m[1]!.trim().toLowerCase();
+    return ZOTERO_HEX_TO_COLOR[raw] ?? null;
+}
