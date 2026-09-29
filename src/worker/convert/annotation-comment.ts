@@ -1,13 +1,58 @@
 /**
- * Bidirectional conversion helpers for Zotero annotation comments.
+ * Bidirectional conversion helpers for Zotero annotation comments and
+ * plain-text metadata fields (title, abstract).
  *
  * Annotation comments use a restricted HTML subset: `<b>`, `<i>`, `<sub>`, `<sup>`.
  * In Obsidian markdown the first two map to native syntax (`**` / `*`), while
  * `<sub>` and `<sup>` pass through as raw inline HTML (Obsidian renders them).
  *
+ * Metadata fields (title, abstractNote) are plain strings in Zotero's API but
+ * may contain `<i>` / `<b>` tags added by the user for formatting. The
+ * `metaHtml2md` / `metaMd2html` pair handles that lighter case without the
+ * `<` / `>` escaping needed for the blockquote-embedded annotation comments.
+ *
  * These converters are intentionally simple — no AST parsing is needed for
  * four tags. They live separately from the full unified pipeline used by notes.
  */
+
+/**
+ * Convert HTML inline marks in a plain metadata string to Markdown.
+ *
+ * Used for `title` and `abstractNote` fields which are stored as plain text
+ * in Zotero but may contain `<i>` / `<b>` / `<em>` / `<strong>` tags.
+ *
+ * - `<b>text</b>` / `<strong>text</strong>` → `**text**`
+ * - `<i>text</i>` / `<em>text</em>`         → `*text*`
+ *
+ * All other HTML tags are stripped.
+ */
+export function metaHtml2md(text: string): string {
+    if (!text) return "";
+    let md = text;
+    md = md.replace(/<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/gi, "**$1**");
+    md = md.replace(/<(?:i|em)>([\s\S]*?)<\/(?:i|em)>/gi, "*$1*");
+    md = md.replace(/<[^>]*>/g, "");
+    return md;
+}
+
+/**
+ * Convert Markdown inline marks back to the HTML subset that Zotero accepts
+ * in plain metadata fields (`abstractNote` etc.).
+ *
+ * - `**text**` → `<b>text</b>`
+ * - `*text*`   → `<i>text</i>`
+ *
+ * Bold is processed before italic to avoid treating `**` as two italic
+ * markers.
+ */
+export function metaMd2html(text: string): string {
+    if (!text) return "";
+    let html = text;
+    html = html.replace(/\*\*([\s\S]*?)\*\*/g, "<b>$1</b>");
+    html = html.replace(/(?<!\*)\*(?!\*)([\s\S]*?)(?<!\*)\*(?!\*)/g, "<i>$1</i>");
+    return html;
+}
+
 
 // Placeholders for <sub>/<sup> tags during escaping
 const PH_SUB_OPEN = "\x00SUB_O\x00";
