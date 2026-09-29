@@ -35,6 +35,8 @@ import type {
     RenderOptions,
 } from "worker/csl";
 import { extractYear } from "utils/date";
+import { splitSpecialTags } from "utils/special-tags";
+import { metaHtml2md } from "worker/convert/annotation-comment";
 import {
     renderLiquid,
     zfEnv,
@@ -53,13 +55,19 @@ year: {{ item.year }}
 url: {{ item.url | json }}
 doi: {{ item.DOI | json }}
 tags: [{% for t in item.tags %}"#{{ t.tag | replace: " ", "_" }}"{% unless forloop.last %}, {% endunless %}{% endfor %}]
+{%- if item.readStatus %}
+read-status: "{{ item.readStatus }}"
+{%- endif %}
+{%- if item.rating %}
+rating: "{{ item.rating }}"
+{%- endif %}
 ---
 {%- capture quote_string %}{{ newline }}> {% endcapture -%}
 {%- capture quote_string_2 %}{{ newline }}> >{% endcapture -%}
 # {{ item.title }}
 {%- if item.abstractNote -%}
 ## Abstract
-> {{ item.abstractNote | replace: newline, quote_string }}
+> {{ item.abstractNote | wrap_editable: "ABSTRACT", item.key | replace: newline, quote_string }}
 
 {%- endif -%}
 {%- if item.attachments.length > 0 -%}
@@ -931,6 +939,9 @@ export class LibraryTemplateService {
 
         const relatedItems = await this.mapToRelatedItems(data);
 
+        const { readStatus, rating, remaining: remainingTags } =
+            splitSpecialTags(data.tags || []);
+
         return {
             key: item.key,
             version: item.version,
@@ -944,14 +955,16 @@ export class LibraryTemplateService {
             attachments,
             relatedItems,
             itemType: item.itemType,
-            title: item.title || "",
+            title: metaHtml2md(item.title || ""),
             creators: creatorsObj,
             date: optionalFields.date || null,
             year: extractYear(optionalFields.date),
             dateAdded: item.dateAdded,
             dateModified: item.dateModified,
             accessDate: optionalFields.accessDate || null,
-            abstractNote: optionalFields.abstractNote,
+            abstractNote: optionalFields.abstractNote
+                ? metaHtml2md(optionalFields.abstractNote)
+                : undefined,
             publicationTitle: optionalFields.publicationTitle,
             publisher: optionalFields.publisher,
             place: optionalFields.place,
@@ -965,7 +978,9 @@ export class LibraryTemplateService {
             DOI: optionalFields.DOI,
             ISBN: optionalFields.ISBN,
             ISSN: optionalFields.ISSN,
-            tags: data.tags || [],
+            tags: remainingTags,
+            readStatus,
+            rating,
             csljson: item.csljson,
         };
     }

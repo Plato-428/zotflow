@@ -50,6 +50,8 @@ export interface ItemTemplateContext {
     ISSN?: string;
 
     tags: Array<{ tag: string; type?: number }>;
+    readStatus?: string;
+    rating?: string;
 
     /** CSL-JSON payload from the Zotero API (synced with include=csljson). */
     csljson?: Record<string, unknown>;
