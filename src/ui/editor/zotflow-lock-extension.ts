@@ -74,24 +74,30 @@ export function ZotFlowLockExtension(
 
             const fmEnd = fm.fmEnd;
 
-            // If the library-id resolves to a library where note edits are
-            // disallowed (read-only sync mode, or API key lacks notes/write
-            // permission), only frontmatter and local-only PERSIST regions
-            // stay editable — PERSIST content never syncs to Zotero, so
-            // library write permissions don't apply to it.
-            const readOnlyLibrary =
-                fm.libraryId !== undefined &&
-                !services.libraryCache.canEditNotes(fm.libraryId);
-
             // Editable regions are active for Zotero source notes
             // (library-id) and local attachment source notes.
             const regionsEnabled = fm.hasLibraryId || fm.isLocal;
-            let regions = regionsEnabled
+            const allRegions = regionsEnabled
                 ? (tr.startState.field(editableRegionsField, false) ?? [])
                 : [];
-            if (readOnlyLibrary) {
-                regions = regions.filter((r) => r.type === "PERSIST");
-            }
+
+            // Gating by region type:
+            // - PERSIST is local-only: always editable.
+            // - Local ANNO: editable for local attachment notes.
+            // - NOTE: requires canEditNotes on the library.
+            // - ABSTRACT / TAGS: require canEditMetadata on the library.
+            const regions = allRegions.filter((r) => {
+                if (r.type === "PERSIST") return true;
+                if (fm.isLocal) return r.type === "ANNO";
+                if (fm.libraryId === undefined) return false;
+                if (r.type === "NOTE") {
+                    return services.libraryCache.canEditNotes(fm.libraryId);
+                }
+                if (r.type === "ABSTRACT" || r.type === "TAGS") {
+                    return services.libraryCache.canEditMetadata(fm.libraryId);
+                }
+                return false;
+            });
             const unlocked =
                 tr.startState.field(unlockedRegionsField, false) ??
                 new Set<string>();

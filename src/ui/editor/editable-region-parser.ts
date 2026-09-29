@@ -22,6 +22,12 @@ const MARKER_REGISTRY: MarkerType[] = [
         endPrefix: "ZF_PERSIST_END_",
         type: "PERSIST",
     },
+    {
+        begPrefix: "ZF_ABSTRACT_BEG_",
+        endPrefix: "ZF_ABSTRACT_END_",
+        type: "ABSTRACT",
+    },
+    { begPrefix: "ZF_TAGS_BEG_", endPrefix: "ZF_TAGS_END_", type: "TAGS" },
 ];
 
 /* ================================================================ */

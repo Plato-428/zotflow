@@ -181,7 +181,13 @@ class RegionBorderPlugin {
         for (const region of regions) {
             // Borders for block-level regions (ANNO lives inside blockquotes
             // and gets no frame)
-            if (region.type !== "NOTE" && region.type !== "PERSIST") continue;
+            if (
+                region.type !== "NOTE" &&
+                region.type !== "PERSIST" &&
+                region.type !== "ABSTRACT" &&
+                region.type !== "TAGS"
+            )
+                continue;
 
             const topBlock = this.view.lineBlockAt(region.begFrom);
             const bottomBlock = this.view.lineBlockAt(region.endTo);
@@ -310,9 +316,14 @@ export function ZotFlowRegionDecorationExtension(
                             widget: new UnlockIconWidget(
                                 region.key,
                                 regionUnlocked,
-                                // PERSIST is local-only: editable even in
-                                // read-only libraries.
-                                lockDisabled && region.type !== "PERSIST",
+                                // PERSIST is local-only: editable even in read-only libraries.
+                                region.type === "PERSIST"
+                                    ? false
+                                    : libraryId !== undefined
+                                      ? region.type === "ABSTRACT" || region.type === "TAGS"
+                                          ? !services.libraryCache.canEditMetadata(libraryId)
+                                          : !services.libraryCache.canEditNotes(libraryId)
+                                      : false,
                             ),
                             side: 1,
                         }),
