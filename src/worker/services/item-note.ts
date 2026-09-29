@@ -6,12 +6,19 @@ import {
 } from "worker/convert/note-links";
 import { createDbNoteLinkResolver } from "./note-link-resolver";
 
-import type { IDBZoteroItem } from "types/db-schema";
+import type { AnyIDBZoteroItem, IDBZoteroItem } from "types/db-schema";
 import type { NoteData } from "types/zotero-item";
 import type { IParentProxy } from "bridge/types";
 import type { ConvertService } from "./convert";
 import type { LibraryNoteService } from "./library-note";
 import type { ZotFlowSettings } from "settings/types";
+import { metaMd2html } from "worker/convert/annotation-comment";
+import {
+    READ_STATUS_TAGS,
+    isRatingTag,
+    matchReadStatusEmoji,
+    type TagLike,
+} from "utils/special-tags";
 
 /**
  * CRUD service for Zotero **child note items** (the note items attached to
@@ -303,5 +310,391 @@ export class ItemNoteService {
             `Deleted note ${noteKey} (${item.syncStatus === "created" ? "hard" : "soft"})`,
             "ItemNoteService",
         );
+    }
+
+    /**
+     * Update the abstract of a top-level bibliographic item.
+     * Called from the source-note editable ABSTRACT region.
+     */
+    async updateItemAbstract(
+        libraryID: number,
+        itemKey: string,
+        abstractText: string,
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemAbstract: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            this.parentHost.log(
+                "warn",
+                `updateItemAbstract: item ${itemKey} is not a top-level bibliographic item`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        const updatedRaw = structuredClone(item.raw);
+        const rawData = (updatedRaw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        const nextAbstract = metaMd2html(abstractText.trim());
+        const currentAbstract = String(rawData.abstractNote ?? "").trim();
+
+        if (currentAbstract === nextAbstract) return;
+
+        rawData.abstractNote = nextAbstract;
+        updatedRaw.data = rawData as unknown as typeof updatedRaw.data;
+
+        const now = new Date().toISOString();
+        rawData.dateModified = now;
+
+        await db.items.update([libraryID, itemKey], {
+            raw: updatedRaw,
+            syncStatus: item.syncStatus === "created" ? "created" : "updated",
+            dateModified: now,
+        });
+
+        this.parentHost.log(
+            "debug",
+            `Updated abstract for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Update the Zotero Reading List status tag on a top-level item.
+     * Called when the `read-status` frontmatter field is edited in Obsidian.
+     * Pass `null`/empty string to remove the status tag entirely.
+     */
+    async updateItemReadStatus(
+        libraryID: number,
+        itemKey: string,
+        newEmoji: string | null,
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemReadStatus: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            return;
+        }
+
+        const normalizedEmoji = newEmoji?.trim() || undefined;
+        if (normalizedEmoji && !READ_STATUS_TAGS[normalizedEmoji]) {
+            this.parentHost.log(
+                "warn",
+                `updateItemReadStatus: unrecognized read-status value "${normalizedEmoji}" for ${itemKey}`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        const rawData = (item.raw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        const currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
+        const currentEmoji = currentTags
+            .map((t) => matchReadStatusEmoji(t.tag))
+            .find((e) => e !== undefined);
+
+        if ((currentEmoji ?? undefined) === normalizedEmoji) return;
+
+        const nextTags = currentTags.filter(
+            (t) => matchReadStatusEmoji(t.tag) === undefined,
+        );
+        if (normalizedEmoji) {
+            nextTags.push({ tag: READ_STATUS_TAGS[normalizedEmoji]! });
+        }
+
+        await this.applyTagUpdate(libraryID, itemKey, item, nextTags);
+
+        this.parentHost.log(
+            "debug",
+            `Updated read-status for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Update the Ethereal Style star-rating tag on a top-level item.
+     * Called when the `rating` frontmatter field is edited in Obsidian.
+     * Pass `null`/empty string to remove the rating tag entirely.
+     */
+    async updateItemRating(
+        libraryID: number,
+        itemKey: string,
+        newStars: string | null,
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemRating: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            return;
+        }
+
+        const normalizedStars = newStars?.trim() || undefined;
+        if (normalizedStars && !isRatingTag(normalizedStars)) {
+            this.parentHost.log(
+                "warn",
+                `updateItemRating: unrecognized rating value "${normalizedStars}" for ${itemKey}`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        const rawData = (item.raw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        const currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
+        const currentStars = currentTags
+            .map((t) => t.tag)
+            .find((tag) => isRatingTag(tag));
+
+        if ((currentStars ?? undefined) === normalizedStars) return;
+
+        const nextTags = currentTags.filter((t) => !isRatingTag(t.tag));
+        if (normalizedStars) {
+            nextTags.push({ tag: normalizedStars });
+        }
+
+        await this.applyTagUpdate(libraryID, itemKey, item, nextTags);
+
+        this.parentHost.log(
+            "debug",
+            `Updated rating for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Replace the generic (non read-status, non-rating) tag set on a
+     * top-level item. Called when the `tags` frontmatter field is edited in
+     * Obsidian. Read-status and rating tags are preserved untouched.
+     */
+    async updateItemTags(
+        libraryID: number,
+        itemKey: string,
+        newTagNames: string[],
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemTags: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            return;
+        }
+
+        const rawData = (item.raw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        const currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
+
+        const preserved = currentTags.filter(
+            (t) =>
+                matchReadStatusEmoji(t.tag) !== undefined ||
+                isRatingTag(t.tag),
+        );
+        const currentRemaining = currentTags.filter(
+            (t) =>
+                matchReadStatusEmoji(t.tag) === undefined &&
+                !isRatingTag(t.tag),
+        );
+
+        const normalizedNew = Array.from(
+            new Set(
+                newTagNames.map((t) => t.trim()).filter((t) => t.length > 0),
+            ),
+        );
+        const normalizedCurrent = currentRemaining.map((t) => t.tag);
+
+        const sortedNew = [...normalizedNew].sort();
+        const sortedCurrent = [...normalizedCurrent].sort();
+        if (JSON.stringify(sortedNew) === JSON.stringify(sortedCurrent)) {
+            return;
+        }
+
+        const nextTags: TagLike[] = [
+            ...preserved,
+            ...normalizedNew.map((tag) => ({ tag })),
+        ];
+
+        await this.applyTagUpdate(libraryID, itemKey, item, nextTags);
+
+        this.parentHost.log(
+            "debug",
+            `Updated tags for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Atomic helper: apply read-status, rating, and/or tags in a single pass
+     * to eliminate race conditions when multiple frontmatter properties change.
+     */
+    async updateItemMetadata(
+        libraryID: number,
+        itemKey: string,
+        patch: {
+            readStatus?: string | null;
+            rating?: string | null;
+            tags?: string[];
+        },
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) {
+            this.parentHost.log(
+                "warn",
+                `updateItemMetadata: item ${itemKey} not found`,
+                "ItemNoteService",
+            );
+            return;
+        }
+        if (
+            item.itemType === "note" ||
+            item.itemType === "annotation" ||
+            item.itemType === "attachment"
+        ) {
+            return;
+        }
+
+        const rawData = (item.raw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        let currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
+
+        // 1. Process readStatus if provided
+        if (patch.readStatus !== undefined) {
+            const normalizedEmoji = patch.readStatus?.trim() || undefined;
+            if (normalizedEmoji && !READ_STATUS_TAGS[normalizedEmoji]) {
+                this.parentHost.log(
+                    "warn",
+                    `updateItemMetadata: unrecognized read-status "${normalizedEmoji}" for ${itemKey}`,
+                    "ItemNoteService",
+                );
+            } else {
+                currentTags = currentTags.filter(
+                    (t) => matchReadStatusEmoji(t.tag) === undefined,
+                );
+                if (normalizedEmoji) {
+                    currentTags.push({ tag: READ_STATUS_TAGS[normalizedEmoji]! });
+                }
+            }
+        }
+
+        // 2. Process rating if provided
+        if (patch.rating !== undefined) {
+            const normalizedStars = patch.rating?.trim() || undefined;
+            if (normalizedStars && !isRatingTag(normalizedStars)) {
+                this.parentHost.log(
+                    "warn",
+                    `updateItemMetadata: unrecognized rating "${normalizedStars}" for ${itemKey}`,
+                    "ItemNoteService",
+                );
+            } else {
+                currentTags = currentTags.filter((t) => !isRatingTag(t.tag));
+                if (normalizedStars) {
+                    currentTags.push({ tag: normalizedStars });
+                }
+            }
+        }
+
+        // 3. Process generic tags if provided
+        if (patch.tags !== undefined) {
+            const preserved = currentTags.filter(
+                (t) =>
+                    matchReadStatusEmoji(t.tag) !== undefined ||
+                    isRatingTag(t.tag),
+            );
+            const normalizedNew = Array.from(
+                new Set(
+                    patch.tags.map((t) => t.trim()).filter((t) => t.length > 0),
+                ),
+            );
+            currentTags = [
+                ...preserved,
+                ...normalizedNew.map((tag) => ({ tag })),
+            ];
+        }
+
+        await this.applyTagUpdate(libraryID, itemKey, item, currentTags);
+
+        this.parentHost.log(
+            "debug",
+            `Updated metadata for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Shared helper: write a new tags array back onto the item's raw data
+     * and synchronize item.searchTags for autocomplete search.
+     */
+    private async applyTagUpdate(
+        libraryID: number,
+        itemKey: string,
+        item: AnyIDBZoteroItem,
+        nextTags: TagLike[],
+    ): Promise<void> {
+        const updatedRaw = structuredClone(item.raw);
+        const rawData = (updatedRaw.data ?? {}) as unknown as Record<
+            string,
+            unknown
+        >;
+        rawData.tags = nextTags;
+        const now = new Date().toISOString();
+        rawData.dateModified = now;
+        updatedRaw.data = rawData as unknown as typeof updatedRaw.data;
+
+        await db.items.update([libraryID, itemKey], {
+            raw: updatedRaw,
+            searchTags: nextTags.map((t) => t.tag),
+            syncStatus: item.syncStatus === "created" ? "created" : "updated",
+            dateModified: now,
+        });
     }
 }
