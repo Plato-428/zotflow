@@ -20,6 +20,7 @@ export interface ItemTemplateContext {
 
     // Metadata
     title: string;
+    plainTitle: string;
     creators: Array<{
         creatorType?: string;
         firstName?: string;

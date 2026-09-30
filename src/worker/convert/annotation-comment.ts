@@ -53,6 +53,36 @@ export function metaMd2html(text: string): string {
     return html;
 }
 
+/**
+ * Strip common Markdown formatting (bold, italic, strikethrough, highlights,
+ * underline, inline code, and HTML tags) from a string.
+ *
+ * Useful for YAML frontmatter fields (like `title`) where formatting marks
+ * become clutter.
+ */
+export function stripMarkdown(text: string): string {
+    if (!text) return "";
+    let clean = text;
+    // Strip HTML tags first if any are present
+    clean = clean.replace(/<[^>]*>/g, "");
+    // Bold / italic combinations (***text*** or ___text___)
+    clean = clean.replace(/(\*\*\*|___)([\s\S]*?)\1/g, "$2");
+    // Bold (**text** or __text__)
+    clean = clean.replace(/(\*\*|__)([\s\S]*?)\1/g, "$2");
+    // Italic (*text* or _text_)
+    clean = clean.replace(/(?<!\*)\*(?!\*)([\s\S]*?)(?<!\*)\*(?!\*)/g, "$1");
+    clean = clean.replace(/(?<!_)_(?!_)([\s\S]*?)(?<!_)_(?!_)/g, "$1");
+    // Strikethrough (~~text~~)
+    clean = clean.replace(/~~([\s\S]*?)~~/g, "$1");
+    // Extended MD highlight (=={color}text== or ==text==)
+    clean = clean.replace(/==(?:\{[^{}]*\})?([\s\S]*?)==/g, "$1");
+    // Extended MD underline (++text++)
+    clean = clean.replace(/\+\+([\s\S]*?)\+\+/g, "$1");
+    // Inline code (`text`)
+    clean = clean.replace(/`([^`\n]*)`/g, "$1");
+    return clean;
+}
+
 
 // Placeholders for <sub>/<sup> tags during escaping
 const PH_SUB_OPEN = "\x00SUB_O\x00";

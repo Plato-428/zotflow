@@ -36,7 +36,7 @@ import type {
 } from "worker/csl";
 import { extractYear } from "utils/date";
 import { splitSpecialTags } from "utils/special-tags";
-import { metaHtml2md } from "worker/convert/annotation-comment";
+import { metaHtml2md, stripMarkdown } from "worker/convert/annotation-comment";
 import {
     renderLiquid,
     zfEnv,
@@ -330,6 +330,10 @@ export class LibraryTemplateService {
                 return `<!-- ZF_${type}_BEG_${key} -->\n${input}\n<!-- ZF_${type}_END_${key} -->`;
             },
         );
+        this.engine.registerFilter("strip_markdown", (input: string) => {
+            if (!input) return "";
+            return stripMarkdown(input);
+        });
         this.engine.registerFilter("html2md", async (input: string) => {
             if (!input) return "";
             const vaultConfig = await this.parentHost.getVaultConfig();
@@ -956,6 +960,7 @@ export class LibraryTemplateService {
             relatedItems,
             itemType: item.itemType,
             title: metaHtml2md(item.title || ""),
+            plainTitle: stripMarkdown(item.title || ""),
             creators: creatorsObj,
             date: optionalFields.date || null,
             year: extractYear(optionalFields.date),

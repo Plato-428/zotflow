@@ -121,7 +121,7 @@ async function seedArticle(
         libraryID: LIB,
         key,
         itemType: "journalArticle",
-        title: "A Study of Things",
+        title: (data.title as string) ?? "A Study of Things",
         citationKey: "doe2020",
         version: 7,
         csljson: { id: key, type: "article-journal", title: "A Study of Things" },
@@ -512,6 +512,19 @@ describe("item context", () => {
         expect(body.trim()).toBe(
             "A Study of Things|2020|Journal of Testing|10.1000/test|doe2020",
         );
+    });
+
+    test("plainTitle strips markdown and HTML marks while title preserves markdown", async () => {
+        const item = await seedArticle("PARENT_TITLE", {
+            title: "Plato's <i>Timaeus</i> and its **reception**",
+        });
+        const body = await render(
+            "Title: {{ item.title }}\nPlain: {{ item.plainTitle }}\nFilter: {{ item.title | strip_markdown }}",
+            item,
+        );
+        expect(body).toContain("Title: Plato's *Timaeus* and its **reception**");
+        expect(body).toContain("Plain: Plato's Timaeus and its reception");
+        expect(body).toContain("Filter: Plato's Timaeus and its reception");
     });
 
     test("every bibliographic field reaches the template", async () => {

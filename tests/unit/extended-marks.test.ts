@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { ConvertService } from "worker/services/convert";
-import { metaHtml2md, metaMd2html, annoHtml2md, annoMd2html } from "worker/convert/annotation-comment";
+import { metaHtml2md, metaMd2html, annoHtml2md, annoMd2html, stripMarkdown } from "worker/convert/annotation-comment";
 import { COLOR_TO_ZOTERO_HEX, ZOTERO_HEX_TO_COLOR } from "worker/convert/features/element";
 
 const convert = new ConvertService();
@@ -169,6 +169,24 @@ describe("extended-marks: underline and colored highlights", () => {
 
             const backHtml = annoMd2html(md);
             expect(backHtml).toBe(html);
+        });
+
+        it("strips bold, italic, highlights, and HTML tags in stripMarkdown", () => {
+            expect(stripMarkdown("Title with <b>bold</b> and <i>italic</i>.")).toBe(
+                "Title with bold and italic.",
+            );
+            expect(stripMarkdown("Title with **bold** and *italic*.")).toBe(
+                "Title with bold and italic.",
+            );
+            expect(stripMarkdown("Title with ==highlight== and ++underline++.")).toBe(
+                "Title with highlight and underline.",
+            );
+            expect(stripMarkdown("Title with =={red}colored== and `code`.")).toBe(
+                "Title with colored and code.",
+            );
+            expect(stripMarkdown("Title with ~~strike~~ and ***both***.")).toBe(
+                "Title with strike and both.",
+            );
         });
     });
 
