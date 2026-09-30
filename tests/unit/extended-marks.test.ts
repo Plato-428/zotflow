@@ -171,4 +171,40 @@ describe("extended-marks: underline and colored highlights", () => {
             expect(backHtml).toBe(html);
         });
     });
+
+    describe("Emphasis and strong whitespace normalization", () => {
+        it("moves trailing space out of <em> to avoid &#x20; entity", async () => {
+            const html = "<p><em>Timaeus </em>51 B</p>";
+            const md = await convert.html2md(html);
+            expect(md).not.toContain("&#x20;");
+            expect(md.trim()).toBe("*Timaeus* 51 B");
+        });
+
+        it("moves trailing space out of <strong> to avoid &#x20; entity", async () => {
+            const html = "<p><strong>world; </strong>such is</p>";
+            const md = await convert.html2md(html);
+            expect(md).not.toContain("&#x20;");
+            expect(md.trim()).toBe("**world;** such is");
+        });
+
+        it("moves leading space out of <em>", async () => {
+            const html = "<p>before <em>italic</em></p>";
+            const md = await convert.html2md(html);
+            expect(md.trim()).toBe("before *italic*");
+        });
+
+        it("moves both leading and trailing space out of <em>", async () => {
+            const html = "<p>before <em> both </em> after</p>";
+            const md = await convert.html2md(html);
+            expect(md).not.toContain("&#x20;");
+            expect(md.trim()).toBe("before *both* after");
+        });
+
+        it("removes purely whitespace emphasis without leaving empty tags", async () => {
+            const html = "<p>before <em> </em> after</p>";
+            const md = await convert.html2md(html);
+            expect(md.trim()).toBe("before after");
+        });
+    });
 });
+
