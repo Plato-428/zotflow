@@ -84,13 +84,13 @@ export function ZotFlowLockExtension(
             // Gating by region type:
             // - PERSIST is local-only: always editable.
             // - Local ANNO: editable for local attachment notes.
-            // - NOTE: requires canEditNotes on the library.
+            // - NOTE / ANNO: requires canEditNotes on the library.
             // - ABSTRACT / TAGS: require canEditMetadata on the library.
             const regions = allRegions.filter((r) => {
                 if (r.type === "PERSIST") return true;
                 if (fm.isLocal) return r.type === "ANNO";
                 if (fm.libraryId === undefined) return false;
-                if (r.type === "NOTE") {
+                if (r.type === "NOTE" || r.type === "ANNO") {
                     return services.libraryCache.canEditNotes(fm.libraryId);
                 }
                 if (r.type === "ABSTRACT" || r.type === "TAGS") {
