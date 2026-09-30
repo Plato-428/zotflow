@@ -12,7 +12,7 @@ import type {
     Root as HRoot,
     RootContent,
 } from "hast";
-import type { ListItem, Paragraph, PhrasingContent } from "mdast";
+import type { List, ListItem, Paragraph, PhrasingContent, Root as MRoot } from "mdast";
 import type { SyntaxFeature } from "./types";
 
 /** mdast types that force a list item into block (loose) layout. */
@@ -93,6 +93,25 @@ export const listFeature: SyntaxFeature = {
             return base;
         },
     }),
+
+    /**
+     * Tighten list items that rehype-remark marks as "spread" because Zotero
+     * wraps every `<li>` child in a `<p>` element.
+     *
+     * remark-stringify renders a listItem as loose (blank line after) when
+     * `spread: true`, which the default rehype->remark handler sets whenever
+     * `<li>` contains a block-level child (`<p>`). Since Zotero's note editor
+     * always uses this structure regardless of whether the user intended a tight
+     * or loose list, all lists should be treated as tight on import.
+     */
+    transformMdastIn(tree: MRoot) {
+        visit(tree, "listItem", (node: ListItem) => {
+            node.spread = false;
+        });
+        visit(tree, "list", (node: List) => {
+            node.spread = false;
+        });
+    },
 
     /**
      * Shape `<li>` / `<td>` contents the way Zotero's note editor does:
