@@ -37,6 +37,7 @@ import type {
 import { extractYear } from "utils/date";
 import { splitSpecialTags } from "utils/special-tags";
 import { metaHtml2md, stripMarkdown } from "worker/convert/annotation-comment";
+import { listToTabs } from "worker/convert/list-tabs";
 import {
     renderLiquid,
     zfEnv,
@@ -334,6 +335,16 @@ export class LibraryTemplateService {
             if (!input) return "";
             return stripMarkdown(input);
         });
+        this.engine.registerFilter(
+            "list_tabs",
+            (input: string, indent?: string) => {
+                if (!input) return "";
+                return listToTabs(
+                    input,
+                    typeof indent === "string" ? indent : "\t",
+                );
+            },
+        );
         this.engine.registerFilter("html2md", async (input: string) => {
             if (!input) return "";
             const vaultConfig = await this.parentHost.getVaultConfig();

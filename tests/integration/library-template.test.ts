@@ -527,6 +527,15 @@ describe("item context", () => {
         expect(body).toContain("Filter: Plato's Timaeus and its reception");
     });
 
+    test("list_tabs filter normalizes space-indented markdown lists to pure tabs", async () => {
+        const item = await seedArticle();
+        const template = `{{ "1. Top\\n   1. Sub\\n10. Top ten\\n    1. Sub under ten\\n       1. Deep" | list_tabs }}`;
+        const body = await render(template, item);
+        expect(body).toBe(
+            "1. Top\n\t1. Sub\n10. Top ten\n\t1. Sub under ten\n\t\t1. Deep",
+        );
+    });
+
     test("every bibliographic field reaches the template", async () => {
         // These are only ever read by user templates, so nothing else in the
         // suite notices if one stops being mapped. One test covers them all

@@ -5,7 +5,8 @@ import type { AnnotationJSON } from "types/zotero-reader";
 import type { IParentProxy } from "bridge/types";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
 import { getLocalSidecarPath } from "utils/utils";
-import { annoHtml2md } from "worker/convert";
+import { annoHtml2md, listToTabs } from "worker/convert";
+import { stripMarkdown } from "worker/convert/annotation-comment";
 import type { AnnotationTemplateContext } from "types/template-context";
 import {
     renderLiquid,
@@ -83,6 +84,20 @@ export class LocalTemplateService {
             };
             return encodeURIComponent(JSON.stringify(navInfo));
         });
+        this.engine.registerFilter("strip_markdown", (input: string) => {
+            if (!input) return "";
+            return stripMarkdown(input);
+        });
+        this.engine.registerFilter(
+            "list_tabs",
+            (input: string, indent?: string) => {
+                if (!input) return "";
+                return listToTabs(
+                    input,
+                    typeof indent === "string" ? indent : "\t",
+                );
+            },
+        );
 
         this.engine.registerFilter(
             "wrap_editable",
