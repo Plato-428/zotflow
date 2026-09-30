@@ -39,7 +39,7 @@ const EXT_MD_COLOR_RE = new RegExp(
     "g",
 );
 const EXT_MD_DEFAULT_HL_RE = /==(?!\s)((?:[^\n=]|\n(?!\n))+?)(?<!\s)==/g;
-const EXT_MD_UNDERLINE_RE = /\+\+((?:[^\n\+]|\n(?!\n))+?)\+\+/g;
+const EXT_MD_UNDERLINE_RE = /\+\+((?:[^\n+]|\n(?!\n))+?)\+\+/g;
 
 /**
  * Matches code blocks, inline code, and math spans so they can be shielded

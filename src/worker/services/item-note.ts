@@ -351,7 +351,10 @@ export class ItemNoteService {
             unknown
         >;
         const nextAbstract = metaMd2html(abstractText.trim());
-        const currentAbstract = String(rawData.abstractNote ?? "").trim();
+        const currentAbstract =
+            typeof rawData.abstractNote === "string"
+                ? rawData.abstractNote.trim()
+                : "";
 
         if (currentAbstract === nextAbstract) return;
 

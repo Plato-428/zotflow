@@ -148,4 +148,23 @@ describe("meta, ids, pairing", () => {
         expect(regions).toHaveLength(1);
         expect(regions[0]!.type).toBe("NOTE");
     });
+
+    test("ABSTRACT region parses properly", () => {
+        const str = `${B("ABSTRACT", "ITEM1")}\n> Abstract paragraph\n${E("ABSTRACT", "ITEM1")}`;
+        const { regions, content } = parse(str);
+        expect(regions).toHaveLength(1);
+        expect(regions[0]!.type).toBe("ABSTRACT");
+        expect(regions[0]!.key).toBe("ITEM1");
+        expect(content(regions[0]!)).toBe("> Abstract paragraph");
+    });
+
+    test("TAGS region parses properly", () => {
+        const str = `${B("TAGS", "ITEM1")}\n**Tags:** #tag1, #tag2\n${E("TAGS", "ITEM1")}`;
+        const { regions, content } = parse(str);
+        expect(regions).toHaveLength(1);
+        expect(regions[0]!.type).toBe("TAGS");
+        expect(regions[0]!.key).toBe("ITEM1");
+        expect(content(regions[0]!)).toBe("**Tags:** #tag1, #tag2");
+    });
 });
+

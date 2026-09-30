@@ -270,11 +270,6 @@ export function ZotFlowRegionDecorationExtension(
                     state.field(unlockedRegionsField, false) ??
                     new Set<string>();
 
-                // Local notes have no library permissions — never disabled.
-                const lockDisabled =
-                    libraryId !== undefined &&
-                    !services.libraryCache.canEditNotes(libraryId);
-
                 const ranges: {
                     from: number;
                     to: number;

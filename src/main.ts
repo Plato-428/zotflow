@@ -70,7 +70,7 @@ export default class ZotFlow extends Plugin {
     private zotFlowSettingTab: ZotFlowSettingTab | undefined;
     private citationSuggest: CitationSuggest;
     private sourceNoteActionElements = new WeakMap<MarkdownView, HTMLElement>();
-    private tagFieldDebouncers = new Map<string, ReturnType<typeof setTimeout>>();
+    private tagFieldDebouncers = new Map<string, number>();
 
     async onload() {
         const startupStarted = performance.now();
@@ -581,7 +581,7 @@ export default class ZotFlow extends Plugin {
 
     onunload() {
         for (const timer of this.tagFieldDebouncers.values()) {
-            clearTimeout(timer);
+            window.clearTimeout(timer);
         }
         this.tagFieldDebouncers.clear();
         services.viewStateService.flushViewStateSave();
@@ -1053,9 +1053,9 @@ export default class ZotFlow extends Plugin {
 
         const file = view.file;
         const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-        const zoteroKey = fm?.["zotero-key"];
-        const libraryID = fm?.["library-id"];
-        const localAttachment = fm?.["zotflow-local-attachment"];
+        const zoteroKey: unknown = fm?.["zotero-key"];
+        const libraryID: unknown = fm?.["library-id"];
+        const localAttachment: unknown = fm?.["zotflow-local-attachment"];
 
         if (typeof zoteroKey === "string" && typeof libraryID === "number") {
             // Library source note
@@ -1115,8 +1115,8 @@ export default class ZotFlow extends Plugin {
         const fm = cache?.frontmatter;
         if (!fm) return;
 
-        const zoteroKey = fm["zotero-key"];
-        const libraryID = fm["library-id"];
+        const zoteroKey: unknown = fm["zotero-key"];
+        const libraryID: unknown = fm["library-id"];
         if (typeof zoteroKey !== "string" || typeof libraryID !== "number") {
             return;
         }
@@ -1141,7 +1141,7 @@ export default class ZotFlow extends Plugin {
 
         let tagNames: string[] = [];
         if (hasTags) {
-            const rawTags = fm["tags"];
+            const rawTags: unknown = fm["tags"];
             const tagList: unknown[] = Array.isArray(rawTags)
                 ? rawTags
                 : typeof rawTags === "string"
@@ -1155,9 +1155,9 @@ export default class ZotFlow extends Plugin {
 
         const debounceKey = file.path;
         const existing = this.tagFieldDebouncers.get(debounceKey);
-        if (existing !== undefined) clearTimeout(existing);
+        if (existing !== undefined) window.clearTimeout(existing);
 
-        const timer = setTimeout(() => {
+        const timer = window.setTimeout(() => {
             this.tagFieldDebouncers.delete(debounceKey);
 
             const patch: {

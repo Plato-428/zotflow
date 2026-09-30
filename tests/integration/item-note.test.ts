@@ -664,3 +664,54 @@ describe("settings updates", () => {
         );
     });
 });
+
+describe("item metadata updates", () => {
+    beforeEach(async () => {
+        await setup();
+    });
+
+    test("updateItemAbstract sets abstract and marks item updated", async () => {
+        await seedItem({
+            libraryID: LIB,
+            key: "ITEM001",
+        });
+
+        await service.updateItemAbstract(LIB, "ITEM001", "New abstract with **bold**");
+
+        const updated = await db.items.get([LIB, "ITEM001"]);
+        expect(updated).toBeDefined();
+        expect(updated?.syncStatus).toBe("updated");
+        expect((updated?.raw.data as unknown as Record<string, unknown>).abstractNote).toBe(
+            "New abstract with <b>bold</b>",
+        );
+    });
+
+    test("updateItemMetadata atomically updates readStatus, rating, and generic tags", async () => {
+        await seedItem({
+            libraryID: LIB,
+            key: "ITEM002",
+        });
+
+        await service.updateItemMetadata(LIB, "ITEM002", {
+            readStatus: "📙",
+            rating: "⭐⭐⭐⭐",
+            tags: ["artificial intelligence", "deep learning"],
+        });
+
+        const updated = await db.items.get([LIB, "ITEM002"]);
+        expect(updated).toBeDefined();
+        expect(updated?.syncStatus).toBe("updated");
+
+        const rawTags = (updated?.raw.data as unknown as Record<string, unknown>).tags as { tag: string }[];
+        const tagNames = rawTags.map((t) => t.tag);
+        expect(tagNames).toContain("📙 To Read");
+        expect(tagNames).toContain("⭐⭐⭐⭐");
+        expect(tagNames).toContain("artificial intelligence");
+        expect(tagNames).toContain("deep learning");
+
+        // Derived searchTags must match the updated generic tags
+        expect(updated?.searchTags).toContain("artificial intelligence");
+        expect(updated?.searchTags).toContain("deep learning");
+    });
+});
+

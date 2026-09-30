@@ -10,7 +10,8 @@ export function normalizeTagsForCompare(tags: unknown): string {
             .map((t: unknown) => {
                 if (typeof t === "string") return t;
                 if (typeof t === "object" && t !== null && "tag" in t) {
-                    return String((t as { tag: unknown }).tag ?? "");
+                    const tagVal = t.tag;
+                    return typeof tagVal === "string" ? tagVal : "";
                 }
                 return "";
             })
@@ -37,8 +38,10 @@ export function isMetadataOnlyLocalChange(
     const localData = (localItem?.raw?.data ?? {}) as unknown as Record<string, unknown>;
     const remoteData = (remoteRaw?.data ?? {}) as unknown as Record<string, unknown>;
 
-    const localAbstract = String(localData.abstractNote ?? "");
-    const remoteAbstract = String(remoteData.abstractNote ?? "");
+    const localAbstract =
+        typeof localData.abstractNote === "string" ? localData.abstractNote : "";
+    const remoteAbstract =
+        typeof remoteData.abstractNote === "string" ? remoteData.abstractNote : "";
     const localTags = normalizeTagsForCompare(localData.tags);
     const remoteTags = normalizeTagsForCompare(remoteData.tags);
 
