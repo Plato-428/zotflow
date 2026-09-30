@@ -189,7 +189,16 @@ const ConflictPanel: React.FC<{
     selectedKey: string | null;
     onSelect: (key: string) => void;
     onResolve: (entry: ConflictItemInfo, action: ConflictAction) => void;
-}> = ({ conflicts, selectedKey, onSelect, onResolve }) => {
+    onPromptResolveAll: (action: ConflictAction) => void;
+    resolvingBulk: boolean;
+}> = ({
+    conflicts,
+    selectedKey,
+    onSelect,
+    onResolve,
+    onPromptResolveAll,
+    resolvingBulk,
+}) => {
     const selected = conflicts.find(
         (c) => `${c.libraryID}:${c.key}` === selectedKey,
     );
@@ -210,6 +219,24 @@ const ConflictPanel: React.FC<{
         <div className="zotflow-conflict-container">
             {/* Conflict list sidebar */}
             <div className="zotflow-conflict-list">
+                <div className="zotflow-conflict-bulk-actions">
+                    <button
+                        className="zotflow-conflict-bulk-btn zotflow-conflict-btn--local"
+                        disabled={resolvingBulk}
+                        onClick={() => onPromptResolveAll("keep-local")}
+                        title="Keep local changes for all conflicts"
+                    >
+                        Keep All Local
+                    </button>
+                    <button
+                        className="zotflow-conflict-bulk-btn zotflow-conflict-btn--remote"
+                        disabled={resolvingBulk}
+                        onClick={() => onPromptResolveAll("accept-remote")}
+                        title="Accept remote changes for all conflicts"
+                    >
+                        Accept All Remote
+                    </button>
+                </div>
                 {conflicts.map((c) => {
                     const id = `${c.libraryID}:${c.key}`;
 
@@ -356,6 +383,9 @@ export const SyncView: React.FC = () => {
     const [syncingLibId, setSyncingLibId] = useState<number | null>(null);
     const [loading, setLoading] = useState(true);
     const [hasResolvedConflicts, setHasResolvedConflicts] = useState(false);
+    const [bulkConfirmAction, setConfirmBulkAction] =
+        useState<ConflictAction | null>(null);
+    const [resolvingBulk, setResolvingBulk] = useState(false);
 
     // Load data on mount
     const refresh = useCallback(async () => {
@@ -366,6 +396,16 @@ export const SyncView: React.FC = () => {
             ]);
             setLibraries(libs);
             setConflicts(conf);
+            setSelectedConflict((prev) => {
+                if (
+                    prev &&
+                    conf.some((c) => `${c.libraryID}:${c.key}` === prev)
+                ) {
+                    return prev;
+                }
+                const first = conf[0];
+                return first ? `${first.libraryID}:${first.key}` : null;
+            });
         } catch (e) {
             services.logService.error(
                 "Failed to load sync data",
@@ -380,6 +420,18 @@ export const SyncView: React.FC = () => {
     useEffect(() => {
         void refresh();
     }, [refresh]);
+
+    // Close bulk confirmation modal on Escape key
+    useEffect(() => {
+        if (!bulkConfirmAction) return;
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key === "Escape") {
+                setConfirmBulkAction(null);
+            }
+        };
+        window.addEventListener("keydown", handleKeyDown);
+        return () => window.removeEventListener("keydown", handleKeyDown);
+    }, [bulkConfirmAction]);
 
     // Auto-refresh when a sync task completes or fails
     useEffect(() => {
@@ -466,18 +518,30 @@ export const SyncView: React.FC = () => {
 
                 setHasResolvedConflicts(true);
 
-                // Remove from local state
-                setConflicts((prev) =>
-                    prev.filter(
-                        (c) => !(c.libraryID === libraryID && c.key === key),
-                    ),
-                );
-
-                // Clear selection if resolved
                 const resolvedId = `${libraryID}:${key}`;
-                setSelectedConflict((prev) =>
-                    prev === resolvedId ? null : prev,
-                );
+
+                // Remove from local state and advance selection to next item
+                setConflicts((prev) => {
+                    const idx = prev.findIndex(
+                        (c) => `${c.libraryID}:${c.key}` === resolvedId,
+                    );
+                    const nextList = prev.filter(
+                        (c) => !(c.libraryID === libraryID && c.key === key),
+                    );
+
+                    setSelectedConflict((current) => {
+                        if (current !== resolvedId) return current;
+                        if (nextList.length === 0) return null;
+                        const nextIdx = Math.min(
+                            idx >= 0 ? idx : 0,
+                            nextList.length - 1,
+                        );
+                        const nextItem = nextList[nextIdx]!;
+                        return `${nextItem.libraryID}:${nextItem.key}`;
+                    });
+
+                    return nextList;
+                });
             } catch (e) {
                 services.logService.error(
                     "Conflict resolution failed",
@@ -488,6 +552,44 @@ export const SyncView: React.FC = () => {
                     "error",
                     "Failed to resolve conflict.",
                 );
+            }
+        },
+        [],
+    );
+
+    // Bulk conflict resolution via ConflictService in worker
+    const handleResolveAll = useCallback(
+        async (action: ConflictAction) => {
+            setResolvingBulk(true);
+            try {
+                const count =
+                    await workerBridge.conflict.resolveAllItemConflicts(action);
+
+                services.logService.info(
+                    `Batch-resolved ${count} conflicts (${action})`,
+                    "SyncView",
+                );
+                services.notificationService.notify(
+                    "success",
+                    `Resolved ${count} conflict${count === 1 ? "" : "s"}: ${action === "keep-local" ? "kept all local" : "accepted all remote"}.`,
+                );
+
+                setHasResolvedConflicts(true);
+                setConflicts([]);
+                setSelectedConflict(null);
+                setConfirmBulkAction(null);
+            } catch (e) {
+                services.logService.error(
+                    "Batch conflict resolution failed",
+                    "SyncView",
+                    e,
+                );
+                services.notificationService.notify(
+                    "error",
+                    "Failed to resolve conflicts.",
+                );
+            } finally {
+                setResolvingBulk(false);
             }
         },
         [],
@@ -534,7 +636,11 @@ export const SyncView: React.FC = () => {
                     conflicts={conflicts}
                     selectedKey={selectedConflict}
                     onSelect={setSelectedConflict}
-                    onResolve={(entry, action) => void handleResolve(entry, action)}
+                    onResolve={(entry, action) =>
+                        void handleResolve(entry, action)
+                    }
+                    onPromptResolveAll={(action) => setConfirmBulkAction(action)}
+                    resolvingBulk={resolvingBulk}
                 />
                 {hasResolvedConflicts && conflicts.length === 0 && (
                     <div className="zotflow-sync-reminder">
@@ -546,6 +652,53 @@ export const SyncView: React.FC = () => {
                     </div>
                 )}
             </div>
+
+            {/* Section 3: Bulk Action Confirmation Modal */}
+            {bulkConfirmAction && (
+                <div
+                    className="zotflow-confirm-overlay"
+                    onClick={() =>
+                        !resolvingBulk && setConfirmBulkAction(null)
+                    }
+                >
+                    <div
+                        className="zotflow-confirm-modal"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="zotflow-confirm-modal-header">
+                            <ObsidianIcon icon="alert-triangle" />
+                            <span>
+                                {bulkConfirmAction === "keep-local"
+                                    ? "Keep All Local Changes?"
+                                    : "Accept All Remote Changes?"}
+                            </span>
+                        </div>
+                        <div className="zotflow-confirm-modal-body">
+                            {bulkConfirmAction === "keep-local"
+                                ? `Are you sure you want to keep local changes for all ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}? This will mark the items as updated so they push to Zotero on the next sync.`
+                                : `Are you sure you want to accept remote changes for all ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}? This will overwrite your local changes with the Zotero remote version.`}
+                        </div>
+                        <div className="zotflow-confirm-modal-actions">
+                            <button
+                                className="zotflow-conflict-btn zotflow-confirm-cancel-btn"
+                                onClick={() => setConfirmBulkAction(null)}
+                                disabled={resolvingBulk}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                className={`zotflow-conflict-btn ${bulkConfirmAction === "keep-local" ? "zotflow-conflict-btn--local" : "zotflow-conflict-btn--remote"}`}
+                                onClick={() =>
+                                    void handleResolveAll(bulkConfirmAction)
+                                }
+                                disabled={resolvingBulk}
+                            >
+                                {resolvingBulk ? "Resolving..." : "Confirm"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };

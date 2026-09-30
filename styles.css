@@ -1393,6 +1393,95 @@
     filter: brightness(1.1);
 }
 
+/* Conflict bulk action buttons */
+.zotflow-conflict-bulk-actions {
+    display: flex;
+    gap: var(--size-4-1);
+    margin-bottom: var(--size-4-2);
+}
+
+.zotflow-conflict-bulk-btn {
+    flex: 1;
+    padding: var(--size-4-1) var(--size-4-2);
+    border: none;
+    border-radius: var(--radius-s);
+    font-size: var(--font-ui-smaller);
+    font-weight: var(--font-medium);
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden;
+}
+
+.zotflow-conflict-bulk-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Conflict confirmation overlay modal */
+.zotflow-confirm-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: var(--size-4-4);
+}
+
+.zotflow-confirm-modal {
+    background-color: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-m);
+    padding: var(--size-4-5);
+    max-width: 440px;
+    width: 100%;
+    box-shadow: var(--shadow-l);
+    display: flex;
+    flex-direction: column;
+    gap: var(--size-4-3);
+}
+
+.zotflow-confirm-modal-header {
+    display: flex;
+    align-items: center;
+    gap: var(--size-4-2);
+    font-size: var(--font-ui-medium);
+    font-weight: var(--font-semibold);
+    color: var(--text-normal);
+}
+
+.zotflow-confirm-modal-header .svg-icon {
+    color: var(--text-warning);
+}
+
+.zotflow-confirm-modal-body {
+    font-size: var(--font-ui-small);
+    color: var(--text-muted);
+    line-height: var(--line-height-normal);
+}
+
+.zotflow-confirm-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--size-4-3);
+    margin-top: var(--size-4-2);
+}
+
+.zotflow-confirm-cancel-btn {
+    background-color: var(--background-modifier-form-field);
+    color: var(--text-normal);
+}
+
+.zotflow-confirm-cancel-btn:hover {
+    background-color: var(--background-modifier-hover);
+}
+
 /* Sync reminder after resolving all conflicts */
 .zotflow-sync-reminder {
     display: flex;
