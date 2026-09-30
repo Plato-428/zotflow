@@ -59,6 +59,7 @@ export class ZoteroReaderView extends ItemView {
     private documentLease?: ReaderDocumentLease;
     private closing = false;
     private readerState: ReaderViewState = { libraryID: 0, itemKey: "" };
+    private pendingNavigation?: ReaderNavigation;
 
     constructor(leaf: WorkspaceLeaf) {
         super(leaf);
@@ -547,6 +548,11 @@ export class ZoteroReaderView extends ItemView {
                 ...opts,
             });
             readerInitialized = true;
+            if (this.pendingNavigation) {
+                const nav = this.pendingNavigation;
+                this.pendingNavigation = undefined;
+                ff(this.bridge.navigate(nav), "Failed to navigate the reader");
+            }
 
             // Subscribe to sync events for live annotation updates
             this.subscribeToSyncEvents();
@@ -580,7 +586,10 @@ export class ZoteroReaderView extends ItemView {
     }
 
     readerNavigate(navigationInfo: ReaderNavigation) {
-        if (!this.bridge) return;
+        if (!this.bridge || this.bridge.state !== "reader-ready") {
+            this.pendingNavigation = navigationInfo;
+            return;
+        }
 
         ff(
             this.bridge.navigate(navigationInfo),
@@ -594,6 +603,7 @@ export class ZoteroReaderView extends ItemView {
 
     async onClose() {
         this.closing = true;
+        this.pendingNavigation = undefined;
         this.unsubscribeTaskMonitor?.();
         this.unsubscribeAnnotationChanged?.();
         this.unsubscribeTaskMonitor = undefined;

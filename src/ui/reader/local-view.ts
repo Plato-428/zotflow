@@ -52,6 +52,7 @@ export class LocalReaderView extends ItemView {
     private documentLease?: ReaderDocumentLease;
     private closing = false;
     private localReaderState: LocalReaderViewState = {};
+    private pendingNavigation?: ReaderNavigation;
 
     constructor(leaf: WorkspaceLeaf) {
         super(leaf);
@@ -427,6 +428,11 @@ export class LocalReaderView extends ItemView {
                     ...opts,
                 });
                 readerInitialized = true;
+                if (this.pendingNavigation) {
+                    const nav = this.pendingNavigation;
+                    this.pendingNavigation = undefined;
+                    ff(this.bridge.navigate(nav), "Failed to navigate the reader");
+                }
             } catch (e) {
                 // If another Promise rejected first, release the lease when its
                 // in-flight load eventually settles.
@@ -482,7 +488,10 @@ export class LocalReaderView extends ItemView {
     }
 
     readerNavigate(navigationInfo: ReaderNavigation) {
-        if (!this.bridge) return;
+        if (!this.bridge || this.bridge.state !== "reader-ready") {
+            this.pendingNavigation = navigationInfo;
+            return;
+        }
         ff(
             this.bridge.navigate(navigationInfo),
             "Failed to navigate the reader",
@@ -491,6 +500,7 @@ export class LocalReaderView extends ItemView {
 
     async onClose() {
         this.closing = true;
+        this.pendingNavigation = undefined;
         this.unsubscribeLocalAnnotationChanged?.();
         this.unsubscribeLocalAnnotationChanged = undefined;
 

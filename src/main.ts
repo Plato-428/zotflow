@@ -42,8 +42,12 @@ import type {
     ZotFlowPluginData,
     ViewStateEntry,
 } from "./settings/types";
-import type { CustomReaderTheme } from "types/zotero-reader";
-import type { AnnotationJSON } from "types/zotero-reader";
+import type {
+    AnnotationJSON,
+    CustomReaderTheme,
+    ReaderNavigation,
+    ZoteroPosition,
+} from "types/zotero-reader";
 import type { AttachmentData } from "types/zotero-item";
 import type { IDBZoteroItem } from "types/db-schema";
 
@@ -765,7 +769,7 @@ export default class ZotFlow extends Plugin {
                 await openAttachment(libID, key, this.app, navigation);
             } else if (type === "open-annotation") {
                 // Locate the annotation by key, then open its parent attachment
-                // navigated to the annotation. Only the annotation id is needed.
+                // navigated to the annotation with pageLabel and position fallbacks.
                 const annotation = await workerBridge.dbHelper.getItem(
                     libID,
                     key,
@@ -785,11 +789,32 @@ export default class ZotFlow extends Plugin {
                     );
                     return;
                 }
+                const rawData = annotation.raw
+                    .data as unknown as Record<string, unknown>;
+                let position: ZoteroPosition | undefined;
+                if (typeof rawData.annotationPosition === "string") {
+                    try {
+                        position = JSON.parse(
+                            rawData.annotationPosition,
+                        ) as ZoteroPosition;
+                    } catch {
+                        // Ignore malformed JSON
+                    }
+                }
+                const pageLabel =
+                    typeof rawData.annotationPageLabel === "string"
+                        ? rawData.annotationPageLabel
+                        : undefined;
+                const nav: ReaderNavigation = {
+                    annotationID: key,
+                    pageLabel,
+                    position,
+                };
                 await openAttachment(
                     libID,
                     attachmentKey,
                     this.app,
-                    JSON.stringify({ annotationID: key }),
+                    JSON.stringify(nav),
                 );
             } else {
                 services.logService.log(
