@@ -2,6 +2,11 @@ import { db } from "db/db";
 import { ZoteroAPIService } from "./zotero";
 import { LibraryService } from "./library";
 import { normalizeItem, normalizeCollection, toZoteroDate } from "db/normalize";
+import {
+    isMetadataOnlyLocalChange,
+    resolveMetadataByTimestamp,
+    keepLocalMetadataEdit,
+} from "./metadata-sync-policy";
 import pLimit from "p-limit";
 import {
     errorMessage,
@@ -586,6 +591,41 @@ export class SyncService {
                                     case "updated":
                                     case "deleted":
                                     case "conflict":
+                                        if (
+                                            localItem.syncStatus === "updated" &&
+                                            isMetadataOnlyLocalChange(
+                                                localItem,
+                                                newItem,
+                                            )
+                                        ) {
+                                            const resolution =
+                                                resolveMetadataByTimestamp(
+                                                    localItem,
+                                                    newItem,
+                                                );
+
+                                            if (resolution === "keep-local") {
+                                                await keepLocalMetadataEdit(
+                                                    libraryID,
+                                                    localItem,
+                                                    newItem,
+                                                );
+                                                return;
+                                            }
+                                            if (resolution === "accept-remote") {
+                                                const cleanItem = normalizeItem(
+                                                    newItem,
+                                                    libraryID,
+                                                );
+                                                cleanItem.syncStatus = "synced";
+                                                await db.items.put(cleanItem);
+                                                changedItems?.push({
+                                                    libraryID,
+                                                    itemKey: cleanItem.key,
+                                                });
+                                                return;
+                                            }
+                                        }
                                         await db.items.update(
                                             [libraryID, localItem.key],
                                             {
