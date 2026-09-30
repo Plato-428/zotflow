@@ -300,6 +300,24 @@ line 3</pre>`,
         ],
     },
 
+    // ── 10b. Tight bullet list (Zotero <p> inside <li>) ──
+    {
+        name: "tight-bullet-list",
+        html: `<ul><li><p>First item</p></li><li><p>Second item</p></li><li><p>Third item</p></li></ul>`,
+        checks: [
+            {
+                type: "md-contains",
+                label: "Tight list items without blank lines",
+                needle: "* First item\n* Second item\n* Third item",
+            },
+            {
+                type: "contains",
+                label: "Preserves list items in html",
+                needle: "<li>",
+            },
+        ],
+    },
+
     // ── 11. Table with header ──
     {
         name: "table",
