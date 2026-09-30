@@ -266,12 +266,12 @@ describe("frontmatter", () => {
         expect(out).not.toContain("??");
     });
 
-    test("keys the template does not mention are carried over untouched", async () => {
+    test("keys the template does not mention are purged on render", async () => {
         const item = await seedArticle();
         const out = await service.renderLibrarySourceNote(item, "body", {
-            "my-own-field": "kept",
+            "my-own-field": "obsolete",
         });
-        expect(out).toContain("my-own-field: kept");
+        expect(out).not.toContain("my-own-field");
     });
 
     test("liquid runs inside the frontmatter block", async () => {

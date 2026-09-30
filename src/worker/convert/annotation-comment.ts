@@ -29,8 +29,26 @@
 export function metaHtml2md(text: string): string {
     if (!text) return "";
     let md = text;
-    md = md.replace(/<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/gi, "**$1**");
-    md = md.replace(/<(?:i|em)>([\s\S]*?)<\/(?:i|em)>/gi, "*$1*");
+    md = md.replace(
+        /<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/gi,
+        (_, inner: string) => {
+            const trimmed = inner.trim();
+            if (!trimmed) return inner;
+            const leading = /^(\s*)/.exec(inner)?.[1] || "";
+            const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+            return `${leading}**${trimmed}**${trailing}`;
+        },
+    );
+    md = md.replace(
+        /<(?:i|em)>([\s\S]*?)<\/(?:i|em)>/gi,
+        (_, inner: string) => {
+            const trimmed = inner.trim();
+            if (!trimmed) return inner;
+            const leading = /^(\s*)/.exec(inner)?.[1] || "";
+            const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+            return `${leading}*${trimmed}*${trailing}`;
+        },
+    );
     md = md.replace(/<[^>]*>/g, "");
     return md;
 }
@@ -106,10 +124,22 @@ export function annoHtml2md(html: string): string {
     let md = html;
 
     // Bold: <b>...</b> → **...**
-    md = md.replace(/<b>([\s\S]*?)<\/b>/gi, "**$1**");
+    md = md.replace(/<b>([\s\S]*?)<\/b>/gi, (_, inner: string) => {
+        const trimmed = inner.trim();
+        if (!trimmed) return inner;
+        const leading = /^(\s*)/.exec(inner)?.[1] || "";
+        const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+        return `${leading}**${trimmed}**${trailing}`;
+    });
 
     // Italic: <i>...</i> → *...*
-    md = md.replace(/<i>([\s\S]*?)<\/i>/gi, "*$1*");
+    md = md.replace(/<i>([\s\S]*?)<\/i>/gi, (_, inner: string) => {
+        const trimmed = inner.trim();
+        if (!trimmed) return inner;
+        const leading = /^(\s*)/.exec(inner)?.[1] || "";
+        const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+        return `${leading}*${trimmed}*${trailing}`;
+    });
 
     // Protect <sub>/<sup> tags with placeholders before escaping < >
     md = md.replace(/<sub>/gi, PH_SUB_OPEN);

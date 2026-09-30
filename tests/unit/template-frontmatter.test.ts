@@ -32,4 +32,13 @@ describe("template frontmatter merge protocol", () => {
     test("an empty prefixed key is ignored", () => {
         expect(mergeTemplateFrontmatter({}, { "??": "ignored" })).toEqual({});
     });
+
+    test("keys removed from the template are purged from the note", () => {
+        expect(
+            mergeTemplateFrontmatter(
+                { oldProperty: "obsolete", title: "Old Title" },
+                { title: "New Title" },
+            ),
+        ).toEqual({ title: "New Title" });
+    });
 });

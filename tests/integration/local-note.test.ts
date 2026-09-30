@@ -194,11 +194,11 @@ describe("local template rendering", () => {
         expect(out).not.toContain("---\r\n");
     });
 
-    test("keys the template does not mention are carried over", async () => {
+    test("keys the template does not mention are purged on render", async () => {
         const out = await templates.renderLocalNote(pdf(), [], "body", {
-            "my-own-field": "kept",
+            "my-own-field": "obsolete",
         });
-        expect(out).toContain("my-own-field: kept");
+        expect(out).not.toContain("my-own-field");
     });
 
     test("unparseable frontmatter is logged and skipped, not fatal", async () => {
@@ -577,9 +577,14 @@ describe("updating a local note", () => {
         ).rejects.toThrow(/refused to overwrite blindly/);
     });
 
-    test("the existing frontmatter is carried into the render", async () => {
+    test("the existing frontmatter for default keys is carried into the render", async () => {
+        await setup({ localSourceNoteTemplatePath: "Templates/Local.md" });
+        host.vault.set(
+            "Templates/Local.md",
+            "---\n??rating: unrated\n---\nbody",
+        );
         const file = pdf();
-        linkNote(file, "Local/Existing.md", "---\n---\nbody", {
+        linkNote(file, "Local/Existing.md", "---\nrating: 5 stars\n---\nbody", {
             rating: "5 stars",
         });
 

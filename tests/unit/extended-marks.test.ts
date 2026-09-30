@@ -159,6 +159,17 @@ describe("extended-marks: underline and colored highlights", () => {
             expect(backHtml).toBe(html);
         });
 
+        it("normalizes whitespace inside emphasis tags in metaHtml2md", () => {
+            expect(metaHtml2md("Plato's <i>Theaetetus </i>")).toBe("Plato's *Theaetetus* ");
+            expect(metaHtml2md("Title with <b> bold </b> words")).toBe("Title with  **bold**  words");
+            expect(metaHtml2md("Title with <i> </i> words")).toBe("Title with   words");
+        });
+
+        it("normalizes whitespace inside emphasis tags in annoHtml2md", () => {
+            expect(annoHtml2md("Comment with <i>italic </i>")).toBe("Comment with *italic* ");
+            expect(annoHtml2md("Comment with <b> bold </b>")).toBe("Comment with  **bold** ");
+        });
+
         it("converts bold and italic in annoHtml2md and annoMd2html while preserving sub/sup", () => {
             const html = "Comment with <b>bold</b>, <i>italic</i>, and <sub>sub</sub><sup>sup</sup>.";
             const md = annoHtml2md(html);
