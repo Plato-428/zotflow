@@ -51,6 +51,7 @@ export interface IParentProxy {
         frontmatter?: Record<string, unknown>;
     }>;
     deleteFile(path: string): Promise<void>;
+    renameFile(oldPath: string, newPath: string): Promise<boolean>;
     readExternalBinaryFile(absolutePath: string): Promise<ArrayBuffer>;
     statExternalFile(absolutePath: string): Promise<ExternalFileStat>;
     openFile(path: string, newLeaf: boolean): Promise<void>;

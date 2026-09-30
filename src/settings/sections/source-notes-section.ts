@@ -85,6 +85,14 @@ export class SourceNotesSection {
                         },
                     },
                     {
+                        name: "Auto-sync Note Paths with Template",
+                        desc: "When enabled, source notes are automatically renamed and moved if the rendered path template changes, updating internal links across the vault.",
+                        control: {
+                            type: "toggle",
+                            key: "autoSyncNotePaths",
+                        },
+                    },
+                    {
                         name: "Convert Item Note Links",
                         desc: "Show links inside item notes as ZotFlow links in Obsidian while storing and syncing them as native Zotero links — clicks open ZotFlow's reader here and Zotero's reader there.",
                         control: {

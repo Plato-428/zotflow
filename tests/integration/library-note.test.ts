@@ -241,8 +241,9 @@ describe("creating a note", () => {
         );
     });
 
-    test("the indexed path is preferred over the template", async () => {
-        // The user may have moved the note; the index knows where it went.
+    test("the indexed path is preferred over the template when path auto-sync is off", async () => {
+        // When auto-sync is disabled, the index location is preserved even if it differs from template.
+        await setup({ autoSyncNotePaths: false });
         await seedArticle();
         placeNote("Moved/Elsewhere.md", "old", { "zotero-key": "PARENT01" });
         host.keyIndex.set("PARENT01", "Moved/Elsewhere.md");
@@ -942,3 +943,95 @@ describe("template path handling", () => {
         expect(reads).toContain("");
     });
 });
+
+describe("path auto-sync", () => {
+    test("renames file to match updated path template and re-indexes", async () => {
+        await seedArticle("PARENT01", 7);
+        const oldPath = "OldSource/@PARENT01.md";
+        const newPath = "Source/@PARENT01.md";
+
+        placeNote(
+            oldPath,
+            "---\nzotero-key: PARENT01\nitem-version: 7\n---\nbody",
+            {
+                "zotero-key": "PARENT01",
+                "item-version": 7,
+            },
+        );
+        host.keyIndex.set("PARENT01", oldPath);
+
+        const returned = await service.ensureNote(LIB, "PARENT01", {});
+
+        expect(returned).toBe(newPath);
+        expect(host.vault.has(newPath)).toBe(true);
+        expect(host.vault.has(oldPath)).toBe(false);
+        expect(host.indexed).toContain(newPath);
+        expect(host.renamed).toEqual([{ oldPath, newPath }]);
+        expect(
+            host
+                .logsAt("info")
+                .some((l) =>
+                    l.message.includes(`renamed "${oldPath}" to "${newPath}"`),
+                ),
+        ).toBe(true);
+    });
+
+    test("skips rename and logs warning when destination path already exists", async () => {
+        await seedArticle("PARENT01", 7);
+        const oldPath = "OldSource/@PARENT01.md";
+        const newPath = "Source/@PARENT01.md";
+
+        placeNote(
+            oldPath,
+            "---\nzotero-key: PARENT01\nitem-version: 7\n---\nbody",
+            {
+                "zotero-key": "PARENT01",
+                "item-version": 7,
+            },
+        );
+        host.keyIndex.set("PARENT01", oldPath);
+        // Destination already occupied by another file
+        host.vault.set(newPath, "existing unrelated note");
+
+        const returned = await service.ensureNote(LIB, "PARENT01", {});
+
+        expect(returned).toBe(oldPath);
+        expect(host.vault.has(oldPath)).toBe(true);
+        expect(host.vault.get(newPath)).toBe("existing unrelated note");
+        expect(host.renamed).toEqual([]);
+        expect(
+            host
+                .logsAt("warn")
+                .some(
+                    (l) =>
+                        l.message.includes("destination") &&
+                        l.message.includes("already exists"),
+                ),
+        ).toBe(true);
+    });
+
+    test("does not rename when autoSyncNotePaths is disabled", async () => {
+        await setup({ autoSyncNotePaths: false });
+        await seedArticle("PARENT01", 7);
+        const oldPath = "OldSource/@PARENT01.md";
+        const newPath = "Source/@PARENT01.md";
+
+        placeNote(
+            oldPath,
+            "---\nzotero-key: PARENT01\nitem-version: 7\n---\nbody",
+            {
+                "zotero-key": "PARENT01",
+                "item-version": 7,
+            },
+        );
+        host.keyIndex.set("PARENT01", oldPath);
+
+        const returned = await service.ensureNote(LIB, "PARENT01", {});
+
+        expect(returned).toBe(oldPath);
+        expect(host.vault.has(oldPath)).toBe(true);
+        expect(host.vault.has(newPath)).toBe(false);
+        expect(host.renamed).toEqual([]);
+    });
+});
+

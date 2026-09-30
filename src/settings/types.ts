@@ -74,6 +74,7 @@ export interface ZotFlowSettings {
     citationWikilinkTemplate: string;
     autoCopyAnnotation: AutoCopyAnnotationMode;
     autoUpdateSourceNotesAfterSync: boolean;
+    autoSyncNotePaths: boolean;
     autoPurgeTrashedSourceNotes: boolean;
     autoDisableNoteImageTextTools: boolean;
     epubFontFamily: string;
@@ -152,6 +153,7 @@ export const DEFAULT_SETTINGS: ZotFlowSettings = {
     citationWikilinkTemplate: "",
     autoCopyAnnotation: "off",
     autoUpdateSourceNotesAfterSync: true,
+    autoSyncNotePaths: true,
     autoPurgeTrashedSourceNotes: false,
     autoDisableNoteImageTextTools: true,
     epubFontFamily: "",

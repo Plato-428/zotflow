@@ -14,6 +14,7 @@ import {
     saveBinaryFile,
     readTextFile,
     checkFile,
+    renameFile,
     deleteFile,
     getLinkedLocalSourceNote,
 } from "utils/file";
@@ -132,6 +133,13 @@ export class ParentHost implements IParentProxy {
 
     public async deleteFile(path: string): Promise<void> {
         await deleteFile(this.app, path);
+    }
+
+    public async renameFile(
+        oldPath: string,
+        newPath: string,
+    ): Promise<boolean> {
+        return renameFile(this.app, oldPath, newPath);
     }
 
     public async readExternalBinaryFile(

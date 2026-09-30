@@ -55,6 +55,8 @@ export interface FakeParentHost extends IParentProxy {
     indexed: string[];
     /** Paths passed to `openFile`, in order. */
     opened: string[];
+    /** Files moved/renamed via renameFile. */
+    renamed: { oldPath: string; newPath: string }[];
     /** Every `onTaskUpdate` call, in order. */
     taskUpdates: { taskId: string; info: ITaskInfo }[];
     /** Annotation/note change events emitted back to the main thread. */
@@ -164,6 +166,7 @@ export function createFakeParentHost(
     const keyIndex = new Map(Object.entries(options.keyIndex ?? {}));
     const indexed: string[] = [];
     const opened: string[] = [];
+    const renamed: { oldPath: string; newPath: string }[] = [];
     const taskUpdates: { taskId: string; info: ITaskInfo }[] = [];
     const events: EventRecord[] = [];
 
@@ -176,6 +179,7 @@ export function createFakeParentHost(
         keyIndex,
         indexed,
         opened,
+        renamed,
         taskUpdates,
         events,
 
@@ -185,6 +189,7 @@ export function createFakeParentHost(
             notices.length = 0;
             indexed.length = 0;
             opened.length = 0;
+            renamed.length = 0;
             taskUpdates.length = 0;
             events.length = 0;
         },
@@ -228,6 +233,33 @@ export function createFakeParentHost(
         deleteFile: async (path) => {
             vault.delete(path);
             binaryVault.delete(path);
+        },
+        renameFile: async (oldPath, newPath) => {
+            if (!vault.has(oldPath) && !binaryVault.has(oldPath)) {
+                return false;
+            }
+            if (vault.has(oldPath)) {
+                const content = vault.get(oldPath)!;
+                vault.delete(oldPath);
+                vault.set(newPath, content);
+            }
+            if (binaryVault.has(oldPath)) {
+                const buf = binaryVault.get(oldPath)!;
+                binaryVault.delete(oldPath);
+                binaryVault.set(newPath, buf);
+            }
+            if (frontmatter.has(oldPath)) {
+                const fm = frontmatter.get(oldPath)!;
+                frontmatter.delete(oldPath);
+                frontmatter.set(newPath, fm);
+            }
+            for (const [k, v] of keyIndex.entries()) {
+                if (v === oldPath) {
+                    keyIndex.set(k, newPath);
+                }
+            }
+            renamed.push({ oldPath, newPath });
+            return true;
         },
         readExternalBinaryFile: async () =>
             unsupported("readExternalBinaryFile"),

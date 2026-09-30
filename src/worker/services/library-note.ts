@@ -359,12 +359,46 @@ export class LibraryNoteService {
             }
 
             // Check physical file status
-            const fileCheck = await this.parentHost.checkFile(path);
+            let fileCheck = await this.parentHost.checkFile(path);
 
             if (
                 fileCheck.exists &&
                 fileCheck.frontmatter?.["zotero-key"] === key
             ) {
+                if (this.settings.autoSyncNotePaths) {
+                    const targetPath =
+                        await this.notePathService.resolveLibraryNotePath(item);
+                    if (targetPath && targetPath !== path) {
+                        const targetCheck =
+                            await this.parentHost.checkFile(targetPath);
+                        if (targetCheck.exists) {
+                            this.parentHost.log(
+                                "warn",
+                                `Cannot auto-sync note path: destination "${targetPath}" already exists. Retaining current path "${path}".`,
+                                "LibraryNoteService",
+                            );
+                        } else {
+                            const renamed = await this.parentHost.renameFile(
+                                path,
+                                targetPath,
+                            );
+                            if (renamed) {
+                                this.parentHost.log(
+                                    "info",
+                                    `Auto-synced note path: renamed "${path}" to "${targetPath}".`,
+                                    "LibraryNoteService",
+                                );
+                                path = targetPath;
+                                fileCheck = {
+                                    ...fileCheck,
+                                    path: targetPath,
+                                };
+                                await this.parentHost.indexFile(targetPath);
+                            }
+                        }
+                    }
+                }
+
                 // Case A: File exists -> Try update (version check)
                 await this.performUpdate(
                     item,

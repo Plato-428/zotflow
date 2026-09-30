@@ -473,6 +473,26 @@ export class FakeObsidianApp {
             },
 
             /**
+             * Renames or moves a file and updates all internal links to it.
+             */
+            renameFile: (file: TFile, newPath: string) => {
+                const to = normalizePath(newPath);
+                this.vaultCalls.push(`rename:${file.path}->${to}`);
+                const stored = this.files.get(file.path);
+                if (stored) {
+                    this.files.delete(file.path);
+                    this.tfiles.delete(file.path);
+                    this.files.set(to, stored);
+                }
+                const fm = this.frontmatter.get(file.path);
+                if (fm) {
+                    this.frontmatter.delete(file.path);
+                    this.frontmatter.set(to, fm);
+                }
+                return Promise.resolve();
+            },
+
+            /**
              * Obsidian builds either a wikilink or a markdown link depending on
              * vault settings; the fake always emits the wikilink form, which is
              * enough to tell "the real API produced this" apart from a caller's

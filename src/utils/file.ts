@@ -203,16 +203,18 @@ export async function readTextFile(
 
 /**
  * Rename/move a file, handling both Vault-tracked and hidden (adapter) paths.
+ * Uses Obsidian's FileManager.renameFile when available to update all internal links across the vault.
  * Ensures the destination's parent folder exists first.
+ * @returns true if the file was moved or was already at destination; false if source file does not exist.
  */
 export async function renameFile(
     app: App,
     oldPath: string,
     newPath: string,
-): Promise<void> {
+): Promise<boolean> {
     const oldNormalized = normalizePath(oldPath);
     const newNormalized = normalizePath(newPath);
-    if (oldNormalized === newNormalized) return;
+    if (oldNormalized === newNormalized) return true;
 
     const folderPath = newNormalized.substring(
         0,
@@ -225,14 +227,21 @@ export async function renameFile(
         const adapter = app.vault.adapter;
         if (await adapter.exists(oldNormalized)) {
             await adapter.rename(oldNormalized, newNormalized);
+            return true;
         }
-        return;
+        return false;
     }
 
     const file = app.vault.getAbstractFileByPath(oldNormalized);
     if (file instanceof TFile) {
-        await app.vault.rename(file, newNormalized);
+        if (app.fileManager?.renameFile) {
+            await app.fileManager.renameFile(file, newNormalized);
+        } else {
+            await app.vault.rename(file, newNormalized);
+        }
+        return true;
     }
+    return false;
 }
 
 /**
