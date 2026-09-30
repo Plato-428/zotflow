@@ -21,6 +21,12 @@
 
 ---
 
+## 1.1 Strict Workspace Boundary
+
+> **MANDATORY POLICY**: Agents must NEVER read, create, or modify any files outside the project workspace folder (`D:\App Files\Scripts\ZotFlow`) under any circumstances without explicit user permission in chat. All file operations, scratch scripts, build artifacts, and tests must remain strictly confined to the workspace.
+
+---
+
 ## 2. Architecture Overview
 
 ZotFlow uses a **Main Thread + Web Worker** split architecture. The main thread
