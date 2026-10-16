@@ -10,3 +10,4 @@ export type { Html2MdOptions } from "./html-to-md";
 export { md2htmlWithProcessors } from "./md-to-html";
 export type { ConvertOptions } from "./md-to-html";
 export { annoHtml2md, annoMd2html } from "./annotation-comment";
+export { listToTabs } from "./list-tabs";

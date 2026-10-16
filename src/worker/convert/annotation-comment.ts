@@ -29,8 +29,26 @@
 export function metaHtml2md(text: string): string {
     if (!text) return "";
     let md = text;
-    md = md.replace(/<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/gi, "**$1**");
-    md = md.replace(/<(?:i|em)>([\s\S]*?)<\/(?:i|em)>/gi, "*$1*");
+    md = md.replace(
+        /<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/gi,
+        (_, inner: string) => {
+            const trimmed = inner.trim();
+            if (!trimmed) return inner;
+            const leading = /^(\s*)/.exec(inner)?.[1] || "";
+            const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+            return `${leading}**${trimmed}**${trailing}`;
+        },
+    );
+    md = md.replace(
+        /<(?:i|em)>([\s\S]*?)<\/(?:i|em)>/gi,
+        (_, inner: string) => {
+            const trimmed = inner.trim();
+            if (!trimmed) return inner;
+            const leading = /^(\s*)/.exec(inner)?.[1] || "";
+            const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+            return `${leading}*${trimmed}*${trailing}`;
+        },
+    );
     md = md.replace(/<[^>]*>/g, "");
     return md;
 }
@@ -51,6 +69,36 @@ export function metaMd2html(text: string): string {
     html = html.replace(/\*\*([\s\S]*?)\*\*/g, "<b>$1</b>");
     html = html.replace(/(?<!\*)\*(?!\*)([\s\S]*?)(?<!\*)\*(?!\*)/g, "<i>$1</i>");
     return html;
+}
+
+/**
+ * Strip common Markdown formatting (bold, italic, strikethrough, highlights,
+ * underline, inline code, and HTML tags) from a string.
+ *
+ * Useful for YAML frontmatter fields (like `title`) where formatting marks
+ * become clutter.
+ */
+export function stripMarkdown(text: string): string {
+    if (!text) return "";
+    let clean = text;
+    // Strip HTML tags first if any are present
+    clean = clean.replace(/<[^>]*>/g, "");
+    // Bold / italic combinations (***text*** or ___text___)
+    clean = clean.replace(/(\*\*\*|___)([\s\S]*?)\1/g, "$2");
+    // Bold (**text** or __text__)
+    clean = clean.replace(/(\*\*|__)([\s\S]*?)\1/g, "$2");
+    // Italic (*text* or _text_)
+    clean = clean.replace(/(?<!\*)\*(?!\*)([\s\S]*?)(?<!\*)\*(?!\*)/g, "$1");
+    clean = clean.replace(/(?<!_)_(?!_)([\s\S]*?)(?<!_)_(?!_)/g, "$1");
+    // Strikethrough (~~text~~)
+    clean = clean.replace(/~~([\s\S]*?)~~/g, "$1");
+    // Extended MD highlight (=={color}text== or ==text==)
+    clean = clean.replace(/==(?:\{[^{}]*\})?([\s\S]*?)==/g, "$1");
+    // Extended MD underline (++text++)
+    clean = clean.replace(/\+\+([\s\S]*?)\+\+/g, "$1");
+    // Inline code (`text`)
+    clean = clean.replace(/`([^`\n]*)`/g, "$1");
+    return clean;
 }
 
 
@@ -76,10 +124,22 @@ export function annoHtml2md(html: string): string {
     let md = html;
 
     // Bold: <b>...</b> → **...**
-    md = md.replace(/<b>([\s\S]*?)<\/b>/gi, "**$1**");
+    md = md.replace(/<b>([\s\S]*?)<\/b>/gi, (_, inner: string) => {
+        const trimmed = inner.trim();
+        if (!trimmed) return inner;
+        const leading = /^(\s*)/.exec(inner)?.[1] || "";
+        const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+        return `${leading}**${trimmed}**${trailing}`;
+    });
 
     // Italic: <i>...</i> → *...*
-    md = md.replace(/<i>([\s\S]*?)<\/i>/gi, "*$1*");
+    md = md.replace(/<i>([\s\S]*?)<\/i>/gi, (_, inner: string) => {
+        const trimmed = inner.trim();
+        if (!trimmed) return inner;
+        const leading = /^(\s*)/.exec(inner)?.[1] || "";
+        const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+        return `${leading}*${trimmed}*${trailing}`;
+    });
 
     // Protect <sub>/<sup> tags with placeholders before escaping < >
     md = md.replace(/<sub>/gi, PH_SUB_OPEN);
