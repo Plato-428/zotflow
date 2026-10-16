@@ -793,7 +793,7 @@ describe("item metadata updates", () => {
                     abstractNote: "Old abstract",
                 },
             },
-        });
+        } as any);
 
         await service.updateItemAbstract(LIB, "ITEM0001", "New abstract with **bold**");
         const item = await db.items.get([LIB, "ITEM0001"]);
@@ -817,7 +817,7 @@ describe("item metadata updates", () => {
                     tags: [{ tag: "old-tag" }, { tag: "📗 Read" }, { tag: "⭐⭐⭐" }],
                 },
             },
-        });
+        } as any);
 
         await service.updateItemTags(LIB, "ITEM0002", ["new-tag-1", "new-tag-2"]);
         const item = await db.items.get([LIB, "ITEM0002"]);
@@ -848,7 +848,7 @@ describe("item metadata updates", () => {
                     tags: [{ tag: "gen-tag" }],
                 },
             },
-        });
+        } as any);
 
         await service.updateItemReadStatus(LIB, "ITEM0003", "📖");
         let item = await db.items.get([LIB, "ITEM0003"]);
@@ -878,7 +878,7 @@ describe("item metadata updates", () => {
                     abstractNote: "",
                 },
             },
-        });
+        } as any);
 
         await service.updateItemMetadata(LIB, "ITEM0004", {
             abstract: "Atomic abstract",

@@ -33,6 +33,7 @@ import { promptNoteGone } from "ui/modals/note-gone-modal";
 
 import { openAttachment, openItemNote } from "utils/viewer";
 import { getLocalSidecarPath } from "utils/utils";
+import { obsidianTagToZoteroTag } from "utils/special-tags";
 import { checkFile, readTextFile, renameFile, deleteFile } from "utils/file";
 import { ActivityCenterModal } from "ui/activity-center/modal";
 import { ZoteroSearchModal } from "ui/modals/suggest";
@@ -72,6 +73,7 @@ export default class ZotFlow extends Plugin {
     private zotFlowSettingTab: ZotFlowSettingTab | undefined;
     private citationSuggest: CitationSuggest;
     private sourceNoteActionElements = new WeakMap<MarkdownView, HTMLElement>();
+    private tagFieldDebouncers = new Map<string, ReturnType<typeof setTimeout>>();
 
     async onload() {
         const startupStarted = performance.now();
@@ -362,6 +364,22 @@ export default class ZotFlow extends Plugin {
         });
 
         this.addCommand({
+            id: "update-active-source-note",
+            name: "Update source note",
+            callback: async () => {
+                await this.updateActiveSourceNote(false);
+            },
+        });
+
+        this.addCommand({
+            id: "force-update-active-source-note",
+            name: "Force update source note",
+            callback: async () => {
+                await this.updateActiveSourceNote(true);
+            },
+        });
+
+        this.addCommand({
             id: "update-all-csl-data",
             name: "Update CSL citation data for all items",
             callback: async () => {
@@ -552,6 +570,16 @@ export default class ZotFlow extends Plugin {
         this.registerEvent(
             this.app.workspace.on("file-menu", this.handleFileMenu.bind(this)),
         );
+
+        // Sync edits to the `read-status` / `rating` frontmatter fields
+        // (Zotero Reading List / Ethereal Style tags, split out of the
+        // generic tags list) back to Zotero as tag changes.
+        this.registerEvent(
+            this.app.metadataCache.on(
+                "changed",
+                this.handleSourceNoteMetadataChanged.bind(this),
+            ),
+        );
         finishStage("Register vault events and CSL layout callback");
         // Wall-clock onload time includes awaited worker/I/O time, not just CPU
         // execution. It excludes bundle parsing before onload and does not wait
@@ -567,6 +595,10 @@ export default class ZotFlow extends Plugin {
         services.viewStateService.flushViewStateSave();
         services.readerDocumentCache.dispose();
         services.enhancementPack.dispose();
+        for (const timer of this.tagFieldDebouncers.values()) {
+            clearTimeout(timer);
+        }
+        this.tagFieldDebouncers.clear();
         workerBridge.terminate();
         revokeBlobUrls();
     }
@@ -909,6 +941,73 @@ export default class ZotFlow extends Plugin {
     }
 
     /**
+     * Command palette handler for "Update source note" and
+     * "Force update source note".
+     *
+     * Reads frontmatter from the currently active markdown view to determine
+     * whether it is a library source note (`zotero-key` + `library-id`) or a
+     * local source note (`zotflow-local-attachment`), then runs the same
+     * update logic as the equivalent right-click context menu items.
+     *
+     * @param force - `true` for force-update (overwrites content + images);
+     *                `false` for incremental update (skips up-to-date content).
+     */
+    private async updateActiveSourceNote(force: boolean): Promise<void> {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view?.file) {
+            services.notificationService.notify(
+                "warning",
+                "No note is currently open.",
+            );
+            return;
+        }
+
+        const file = view.file;
+        const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+        const zoteroKey = fm?.["zotero-key"];
+        const libraryID = fm?.["library-id"];
+        const localAttachment = fm?.["zotflow-local-attachment"];
+
+        if (typeof zoteroKey === "string" && typeof libraryID === "number") {
+            // Library source note
+            try {
+                await workerBridge.libraryNote.triggerUpdate(
+                    libraryID,
+                    zoteroKey,
+                    force
+                        ? { forceUpdateContent: true, forceUpdateImages: true }
+                        : {},
+                    false,
+                );
+                services.notificationService.notify(
+                    "success",
+                    force ? "Source note force-updated." : "Source note updated.",
+                );
+            } catch (e) {
+                const msg = force
+                    ? "Failed to force-update source note."
+                    : "Failed to update source note.";
+                services.notificationService.notify("error", msg);
+                services.logService.error(
+                    force
+                        ? "Failed to force-update library source note"
+                        : "Failed to update library source note",
+                    "Main",
+                    e,
+                );
+            }
+        } else if (typeof localAttachment === "string") {
+            // Local source notes always do a full re-render; force flag unused.
+            await this.updateLocalSourceNoteFromMenu(file, localAttachment);
+        } else {
+            services.notificationService.notify(
+                "warning",
+                "This is not a valid ZotFlow source note.",
+            );
+        }
+    }
+
+    /**
      * Right-click "Update source note" entries.
      * - Library source note (zotero-key + library-id): incremental + force.
      * - Local source note (zotflow-local-attachment): single update entry
@@ -1039,6 +1138,110 @@ export default class ZotFlow extends Plugin {
                     });
             });
         }
+    }
+
+    /**
+     * Detect edits to the `read-status` / `rating` / `tags` frontmatter
+     * fields on a library source note and push them back to Zotero as tag
+     * changes (Zotero Reading List status tags, Ethereal Style star-rating
+     * tags, and generic tags respectively). Debounced per-file so rapid
+     * edits (typing, undo, etc.) coalesce into a single worker call. No-op
+     * if the values already match — the worker methods themselves are
+     * idempotent — so this is safe to run on every metadata-cache recompute
+     * (including vault startup indexing).
+     */
+    private handleSourceNoteMetadataChanged(file: TFile): void {
+        if (file.extension !== "md") return;
+
+        const cache = this.app.metadataCache.getFileCache(file);
+        const fm = cache?.frontmatter;
+        if (!fm) return;
+
+        const zoteroKey = fm["zotero-key"];
+        const libraryID = fm["library-id"];
+        if (typeof zoteroKey !== "string" || typeof libraryID !== "number") {
+            return;
+        }
+
+        // Only act if the template actually renders these fields — avoids
+        // doing any work for notes that haven't been re-rendered yet.
+        const hasReadStatus = Object.prototype.hasOwnProperty.call(
+            fm,
+            "read-status",
+        );
+        const hasRating = Object.prototype.hasOwnProperty.call(fm, "rating");
+        const hasTags = Object.prototype.hasOwnProperty.call(fm, "tags");
+        if (!hasReadStatus && !hasRating && !hasTags) return;
+
+        const readStatus =
+            typeof fm["read-status"] === "string" ? fm["read-status"] : "";
+        const rating = typeof fm["rating"] === "string" ? fm["rating"] : "";
+
+        let tagNames: string[] = [];
+        if (hasTags) {
+            const rawTags = fm["tags"];
+            const tagList: unknown[] = Array.isArray(rawTags)
+                ? rawTags
+                : typeof rawTags === "string"
+                  ? rawTags.split(",")
+                  : [];
+            tagNames = tagList
+                .filter((t): t is string => typeof t === "string")
+                .map((t) => obsidianTagToZoteroTag(t))
+                .filter((t) => t.length > 0);
+        }
+
+        const debounceKey = file.path;
+        const existing = this.tagFieldDebouncers.get(debounceKey);
+        if (existing !== undefined) clearTimeout(existing);
+
+        const timer = setTimeout(() => {
+            this.tagFieldDebouncers.delete(debounceKey);
+
+            if (hasReadStatus) {
+                workerBridge.itemNote
+                    .updateItemReadStatus(
+                        libraryID,
+                        zoteroKey,
+                        readStatus.trim() || null,
+                    )
+                    .catch((e) => {
+                        services.logService.error(
+                            "Failed to sync read-status to Zotero",
+                            "Main",
+                            e,
+                        );
+                    });
+            }
+            if (hasRating) {
+                workerBridge.itemNote
+                    .updateItemRating(
+                        libraryID,
+                        zoteroKey,
+                        rating.trim() || null,
+                    )
+                    .catch((e) => {
+                        services.logService.error(
+                            "Failed to sync rating to Zotero",
+                            "Main",
+                            e,
+                        );
+                    });
+            }
+            if (hasTags) {
+                workerBridge.itemNote
+                    .updateItemTags(libraryID, zoteroKey, tagNames)
+                    .catch((e) => {
+                        services.logService.error(
+                            "Failed to sync tags to Zotero",
+                            "Main",
+                            e,
+                        );
+                    });
+            }
+        }, 2000);
+
+        this.tagFieldDebouncers.set(debounceKey, timer);
     }
 
     /**

@@ -430,14 +430,15 @@ export class ItemNoteService {
         const item = await db.items.get([libraryID, itemKey]);
         if (!item) return;
 
+        const rawData = item.raw.data as unknown as Record<string, unknown>;
         const currentAbstract =
-            typeof item.raw.data.abstractNote === "string"
-                ? item.raw.data.abstractNote.trim()
+            typeof rawData.abstractNote === "string"
+                ? (rawData.abstractNote as string).trim()
                 : "";
         if (currentAbstract === nextAbstract) return;
 
         await mutateItem(libraryID, itemKey, (data) => {
-            (data as Record<string, unknown>).abstractNote = nextAbstract;
+            (data as unknown as Record<string, unknown>).abstractNote = nextAbstract;
         });
 
         this.parentHost.log(
@@ -651,9 +652,10 @@ export class ItemNoteService {
         let nextAbstract = "";
         if (patch.abstract !== undefined) {
             nextAbstract = metaMd2html(patch.abstract.trim());
+            const rawData = item.raw.data as unknown as Record<string, unknown>;
             const currentAbstract =
-                typeof item.raw.data.abstractNote === "string"
-                    ? item.raw.data.abstractNote.trim()
+                typeof rawData.abstractNote === "string"
+                    ? (rawData.abstractNote as string).trim()
                     : "";
             if (currentAbstract !== nextAbstract) {
                 abstractChanged = true;
@@ -667,7 +669,7 @@ export class ItemNoteService {
                 data.tags = nextTags;
             }
             if (abstractChanged) {
-                (data as Record<string, unknown>).abstractNote = nextAbstract;
+                (data as unknown as Record<string, unknown>).abstractNote = nextAbstract;
             }
         });
 

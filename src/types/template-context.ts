@@ -58,8 +58,8 @@ export interface ItemTemplateContext extends ItemMetadataContext {
 
     /** Zotero Reading List status string (e.g. "📖 In Progress"), extracted from tags. */
     readStatus?: string;
-    /** Ethereal Style star rating number (1-5), extracted from tags. */
-    rating?: number;
+    /** Ethereal Style star rating string (e.g. "⭐⭐⭐"), extracted from tags. */
+    rating?: string;
     /** Plain text title with all Markdown formatting symbols stripped. */
     plainTitle?: string;
 
