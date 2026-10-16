@@ -11,6 +11,12 @@ import {
     zoteroToZotflowLinks,
 } from "worker/convert/note-links";
 import { createDbNoteLinkResolver } from "./note-link-resolver";
+import { metaMd2html } from "worker/convert/annotation-comment";
+import {
+    matchReadStatusEmoji,
+    isRatingTag,
+    READ_STATUS_TAGS,
+} from "utils/special-tags";
 
 import type { IDBZoteroItem } from "types/db-schema";
 import type { NoteData } from "types/zotero-item";
@@ -407,6 +413,267 @@ export class ItemNoteService {
         this.parentHost.log(
             "info",
             `Deleted note ${noteKey} (${removed.length > 0 ? "hard" : "soft"})`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Update the abstract of a top-level item in IDB.
+     * Stamped as a local edit via mutateItem so the next sync uploads it.
+     */
+    async updateItemAbstract(
+        libraryID: number,
+        itemKey: string,
+        abstractText: string,
+    ): Promise<void> {
+        const nextAbstract = metaMd2html(abstractText.trim());
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) return;
+
+        const currentAbstract =
+            typeof item.raw.data.abstractNote === "string"
+                ? item.raw.data.abstractNote.trim()
+                : "";
+        if (currentAbstract === nextAbstract) return;
+
+        await mutateItem(libraryID, itemKey, (data) => {
+            (data as Record<string, unknown>).abstractNote = nextAbstract;
+        });
+
+        this.parentHost.log(
+            "debug",
+            `Updated abstract for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Update the generic tags of an item, preserving special read-status and rating tags.
+     */
+    async updateItemTags(
+        libraryID: number,
+        itemKey: string,
+        tagNames: string[],
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) return;
+
+        const currentRawTags = ((item.raw.data.tags ?? []) as Array<{ tag: string; type?: number }>);
+        const currentSpecial = currentRawTags.filter(
+            (t) =>
+                matchReadStatusEmoji(t.tag) !== undefined ||
+                isRatingTag(t.tag),
+        );
+
+        const newGeneric = tagNames
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0)
+            .map((t) => ({ tag: t }));
+
+        const nextTags = [...newGeneric, ...currentSpecial];
+
+        await mutateItem(libraryID, itemKey, (data) => {
+            data.tags = nextTags;
+        });
+
+        this.parentHost.log(
+            "debug",
+            `Updated tags for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Update the Zotero Reading List status tag on a top-level item.
+     * Pass null or empty string to remove the status tag.
+     */
+    async updateItemReadStatus(
+        libraryID: number,
+        itemKey: string,
+        newEmoji: string | null,
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item || item.itemType === "note" || item.itemType === "annotation" || item.itemType === "attachment") {
+            return;
+        }
+
+        const normalizedEmoji = newEmoji?.trim() || undefined;
+        if (normalizedEmoji && !READ_STATUS_TAGS[normalizedEmoji]) {
+            this.parentHost.log(
+                "warn",
+                `updateItemReadStatus: unrecognized read-status value "${normalizedEmoji}" for ${itemKey}`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        const currentTags = ((item.raw.data.tags ?? []) as Array<{ tag: string; type?: number }>);
+        const currentEmoji = currentTags
+            .map((t) => matchReadStatusEmoji(t.tag))
+            .find((e) => e !== undefined);
+
+        if ((currentEmoji ?? undefined) === normalizedEmoji) return;
+
+        const nextTags = currentTags.filter(
+            (t) => matchReadStatusEmoji(t.tag) === undefined,
+        );
+        if (normalizedEmoji) {
+            nextTags.push({ tag: READ_STATUS_TAGS[normalizedEmoji]! });
+        }
+
+        await mutateItem(libraryID, itemKey, (data) => {
+            data.tags = nextTags;
+        });
+
+        this.parentHost.log(
+            "debug",
+            `Updated read-status for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Update the star rating tag on a top-level item.
+     * Pass null to remove the rating tag.
+     */
+    async updateItemRating(
+        libraryID: number,
+        itemKey: string,
+        newStars: string | null,
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item || item.itemType === "note" || item.itemType === "annotation" || item.itemType === "attachment") {
+            return;
+        }
+
+        const normalizedStars = newStars?.trim() || undefined;
+        if (normalizedStars && !isRatingTag(normalizedStars)) {
+            this.parentHost.log(
+                "warn",
+                `updateItemRating: unrecognized rating value "${normalizedStars}" for ${itemKey}`,
+                "ItemNoteService",
+            );
+            return;
+        }
+
+        const currentTags = ((item.raw.data.tags ?? []) as Array<{ tag: string; type?: number }>);
+        const currentStars = currentTags
+            .map((t) => t.tag)
+            .find((tag) => isRatingTag(tag));
+
+        if ((currentStars ?? undefined) === normalizedStars) return;
+
+        const nextTags = currentTags.filter((t) => !isRatingTag(t.tag));
+        if (normalizedStars) {
+            nextTags.push({ tag: normalizedStars });
+        }
+
+        await mutateItem(libraryID, itemKey, (data) => {
+            data.tags = nextTags;
+        });
+
+        this.parentHost.log(
+            "debug",
+            `Updated rating for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Combined atomic update for frontmatter metadata changes (tags, read-status, rating, abstract).
+     * Single mutateItem transaction prevents races and ensures search index consistency.
+     */
+    async updateItemMetadata(
+        libraryID: number,
+        itemKey: string,
+        patch: {
+            tags?: string[];
+            readStatus?: string | null;
+            rating?: string | null;
+            abstract?: string;
+        },
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) return;
+
+        let tagsChanged = false;
+        let nextTags: Array<{ tag: string; type?: number }> = (item.raw.data.tags ?? []) as Array<{ tag: string; type?: number }>;
+
+        if (patch.tags !== undefined) {
+            const currentSpecial = nextTags.filter(
+                (t) =>
+                    matchReadStatusEmoji(t.tag) !== undefined ||
+                    isRatingTag(t.tag),
+            );
+            const newGeneric = patch.tags
+                .map((t) => t.trim())
+                .filter((t) => t.length > 0)
+                .map((t) => ({ tag: t }));
+            nextTags = [...newGeneric, ...currentSpecial];
+            tagsChanged = true;
+        }
+
+        if (patch.readStatus !== undefined) {
+            const normalizedEmoji = patch.readStatus?.trim() || undefined;
+            if (!normalizedEmoji || READ_STATUS_TAGS[normalizedEmoji]) {
+                const currentEmoji = nextTags
+                    .map((t) => matchReadStatusEmoji(t.tag))
+                    .find((e) => e !== undefined);
+                if ((currentEmoji ?? undefined) !== normalizedEmoji) {
+                    nextTags = nextTags.filter(
+                        (t) => matchReadStatusEmoji(t.tag) === undefined,
+                    );
+                    if (normalizedEmoji) {
+                        nextTags.push({ tag: READ_STATUS_TAGS[normalizedEmoji]! });
+                    }
+                    tagsChanged = true;
+                }
+            }
+        }
+
+        if (patch.rating !== undefined) {
+            const normalizedStars = patch.rating?.trim() || undefined;
+            if (!normalizedStars || isRatingTag(normalizedStars)) {
+                const currentStars = nextTags
+                    .map((t) => t.tag)
+                    .find((tag) => isRatingTag(tag));
+                if ((currentStars ?? undefined) !== normalizedStars) {
+                    nextTags = nextTags.filter((t) => !isRatingTag(t.tag));
+                    if (normalizedStars) {
+                        nextTags.push({ tag: normalizedStars });
+                    }
+                    tagsChanged = true;
+                }
+            }
+        }
+
+        let abstractChanged = false;
+        let nextAbstract = "";
+        if (patch.abstract !== undefined) {
+            nextAbstract = metaMd2html(patch.abstract.trim());
+            const currentAbstract =
+                typeof item.raw.data.abstractNote === "string"
+                    ? item.raw.data.abstractNote.trim()
+                    : "";
+            if (currentAbstract !== nextAbstract) {
+                abstractChanged = true;
+            }
+        }
+
+        if (!tagsChanged && !abstractChanged) return;
+
+        await mutateItem(libraryID, itemKey, (data) => {
+            if (tagsChanged) {
+                data.tags = nextTags;
+            }
+            if (abstractChanged) {
+                (data as Record<string, unknown>).abstractNote = nextAbstract;
+            }
+        });
+
+        this.parentHost.log(
+            "debug",
+            `Updated metadata for ${itemKey} (tags=${tagsChanged}, abstract=${abstractChanged})`,
             "ItemNoteService",
         );
     }

@@ -6,11 +6,12 @@ import {
     type Text,
 } from "@codemirror/state";
 import { ViewPlugin, type EditorView, type ViewUpdate } from "@codemirror/view";
-import { TFile } from "obsidian";
+import { TFile, editorInfoField } from "obsidian";
 import { workerBridge } from "bridge";
 import { services } from "services/services";
 import { LocalDataManager } from "ui/reader/local-data-manager";
 import { registerNoteTextSource } from "ui/modals/note-gone-modal";
+import { parseTagsLine, zoteroTagToObsidianTag } from "utils/special-tags";
 import {
     parseEditableRegions,
     type EditableRegion,
@@ -301,6 +302,74 @@ const editableRegionSyncPlugin = ViewPlugin.fromClass(
                             sourceKey,
                         )
                         .catch((e: unknown) => this.reportSendFailure(e));
+                } else if (region.type === "ABSTRACT") {
+                    const content = state.doc.sliceString(
+                        region.from,
+                        region.to,
+                    );
+                    const stripped = content.replace(/^>[ \t]?/gm, "");
+                    workerBridge.editQueue
+                        .submitAbstract(
+                            target.libraryId,
+                            region.key,
+                            stripped,
+                            sourceKey,
+                        )
+                        .catch((e: unknown) => this.reportSendFailure(e));
+
+                    const fileInfo = state.field(editorInfoField, false);
+                    const file = fileInfo?.file;
+                    if (file) {
+                        fileInfo.app.fileManager
+                            .processFrontMatter(
+                                file,
+                                (fm: Record<string, unknown>) => {
+                                    if (
+                                        Object.prototype.hasOwnProperty.call(
+                                            fm,
+                                            "abstract",
+                                        )
+                                    ) {
+                                        fm.abstract = stripped;
+                                    }
+                                },
+                            )
+                            .catch(() => {});
+                    }
+                } else if (region.type === "TAGS") {
+                    const content = state.doc.sliceString(
+                        region.from,
+                        region.to,
+                    );
+                    const tags = parseTagsLine(content);
+                    workerBridge.editQueue
+                        .submitTags(
+                            target.libraryId,
+                            region.key,
+                            tags,
+                            sourceKey,
+                        )
+                        .catch((e: unknown) => this.reportSendFailure(e));
+
+                    const fileInfo = state.field(editorInfoField, false);
+                    const file = fileInfo?.file;
+                    if (file) {
+                        fileInfo.app.fileManager
+                            .processFrontMatter(
+                                file,
+                                (fm: Record<string, unknown>) => {
+                                    if (
+                                        Object.prototype.hasOwnProperty.call(
+                                            fm,
+                                            "tags",
+                                        )
+                                    ) {
+                                        fm.tags = tags.map((t) => zoteroTagToObsidianTag(t));
+                                    }
+                                },
+                            )
+                            .catch(() => {});
+                    }
                 }
                 return;
             }

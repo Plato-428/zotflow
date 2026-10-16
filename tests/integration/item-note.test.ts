@@ -776,3 +776,128 @@ describe("settings updates", () => {
         );
     });
 });
+
+describe("item metadata updates", () => {
+    test("updateItemAbstract sets abstractNote and triggers mutateItem", async () => {
+        await seedItem({
+            libraryID: LIB,
+            key: "ITEM0001",
+            raw: {
+                key: "ITEM0001",
+                version: 1,
+                data: {
+                    key: "ITEM0001",
+                    version: 1,
+                    itemType: "journalArticle",
+                    title: "Test Paper",
+                    abstractNote: "Old abstract",
+                },
+            },
+        });
+
+        await service.updateItemAbstract(LIB, "ITEM0001", "New abstract with **bold**");
+        const item = await db.items.get([LIB, "ITEM0001"]);
+        expect(item).toBeDefined();
+        expect((item!.raw.data as any).abstractNote).toBe("New abstract with <b>bold</b>");
+        expect(item!.syncStatus).toBe("updated");
+    });
+
+    test("updateItemTags updates generic tags while preserving special tags", async () => {
+        await seedItem({
+            libraryID: LIB,
+            key: "ITEM0002",
+            raw: {
+                key: "ITEM0002",
+                version: 1,
+                data: {
+                    key: "ITEM0002",
+                    version: 1,
+                    itemType: "journalArticle",
+                    title: "Test Paper 2",
+                    tags: [{ tag: "old-tag" }, { tag: "📗 Read" }, { tag: "⭐⭐⭐" }],
+                },
+            },
+        });
+
+        await service.updateItemTags(LIB, "ITEM0002", ["new-tag-1", "new-tag-2"]);
+        const item = await db.items.get([LIB, "ITEM0002"]);
+        const tags = (item!.raw.data as any).tags;
+        expect(tags).toEqual(
+            expect.arrayContaining([
+                { tag: "new-tag-1" },
+                { tag: "new-tag-2" },
+                { tag: "📗 Read" },
+                { tag: "⭐⭐⭐" },
+            ]),
+        );
+        expect(tags.find((t: any) => t.tag === "old-tag")).toBeUndefined();
+    });
+
+    test("updateItemReadStatus and updateItemRating update special tags properly", async () => {
+        await seedItem({
+            libraryID: LIB,
+            key: "ITEM0003",
+            raw: {
+                key: "ITEM0003",
+                version: 1,
+                data: {
+                    key: "ITEM0003",
+                    version: 1,
+                    itemType: "journalArticle",
+                    title: "Test Paper 3",
+                    tags: [{ tag: "gen-tag" }],
+                },
+            },
+        });
+
+        await service.updateItemReadStatus(LIB, "ITEM0003", "📖");
+        let item = await db.items.get([LIB, "ITEM0003"]);
+        let tags = (item!.raw.data as any).tags;
+        expect(tags.some((t: any) => t.tag === "📖 In Progress")).toBe(true);
+
+        await service.updateItemRating(LIB, "ITEM0003", "⭐⭐⭐⭐");
+        item = await db.items.get([LIB, "ITEM0003"]);
+        tags = (item!.raw.data as any).tags;
+        expect(tags.some((t: any) => t.tag === "⭐⭐⭐⭐")).toBe(true);
+        expect(tags.some((t: any) => t.tag === "gen-tag")).toBe(true);
+    });
+
+    test("updateItemMetadata performs atomic batch update", async () => {
+        await seedItem({
+            libraryID: LIB,
+            key: "ITEM0004",
+            raw: {
+                key: "ITEM0004",
+                version: 1,
+                data: {
+                    key: "ITEM0004",
+                    version: 1,
+                    itemType: "journalArticle",
+                    title: "Test Paper 4",
+                    tags: [],
+                    abstractNote: "",
+                },
+            },
+        });
+
+        await service.updateItemMetadata(LIB, "ITEM0004", {
+            abstract: "Atomic abstract",
+            tags: ["topic/ai"],
+            readStatus: "📗",
+            rating: "⭐⭐⭐⭐⭐",
+        });
+
+        const item = await db.items.get([LIB, "ITEM0004"]);
+        expect((item!.raw.data as any).abstractNote).toBe("Atomic abstract");
+        const tags = (item!.raw.data as any).tags;
+        expect(tags).toEqual(
+            expect.arrayContaining([
+                { tag: "topic/ai" },
+                { tag: "📗 Read" },
+                { tag: "⭐⭐⭐⭐⭐" },
+            ]),
+        );
+    });
+});
+
+

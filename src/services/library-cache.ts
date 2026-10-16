@@ -107,4 +107,8 @@ export class LibraryCache {
             this.canWrite(libraryID)
         );
     }
+
+    canEditMetadata(libraryID: number): boolean {
+        return this.isBidirectional(libraryID) && this.canWrite(libraryID);
+    }
 }

@@ -30,6 +30,20 @@ type QueuedEdit =
           /** The comment as markdown. */
           content: string;
           sourceKey: string;
+      }
+    | {
+          kind: "abstract";
+          libraryID: number;
+          key: string;
+          content: string;
+          sourceKey: string;
+      }
+    | {
+          kind: "tags";
+          libraryID: number;
+          key: string;
+          tags: string[];
+          sourceKey: string;
       };
 
 /**
@@ -73,6 +87,16 @@ export class EditQueue {
     /** Queues the latest comment (markdown) of an annotation. */
     submitAnnotationComment(libraryID: number, annotationKey: string, markdown: string, sourceKey: string): void {
         this.queue({ kind: "annotation", libraryID, key: annotationKey, content: markdown, sourceKey });
+    }
+
+    /** Queues the latest abstract text of an item. */
+    submitAbstract(libraryID: number, itemKey: string, abstractText: string, sourceKey: string): void {
+        this.queue({ kind: "abstract", libraryID, key: itemKey, content: abstractText, sourceKey });
+    }
+
+    /** Queues the latest tags of an item. */
+    submitTags(libraryID: number, itemKey: string, tags: string[], sourceKey: string): void {
+        this.queue({ kind: "tags", libraryID, key: itemKey, tags, sourceKey });
     }
 
     /** Writes now what is waiting for the source note of `sourceKey`. */
@@ -130,6 +154,14 @@ export class EditQueue {
         try {
             if (edit.kind === "annotation") {
                 await this.annotation.updateAnnotationComment(edit.libraryID, edit.key, edit.content);
+                return;
+            }
+            if (edit.kind === "abstract") {
+                await this.itemNote.updateItemAbstract(edit.libraryID, edit.key, edit.content);
+                return;
+            }
+            if (edit.kind === "tags") {
+                await this.itemNote.updateItemTags(edit.libraryID, edit.key, edit.tags);
                 return;
             }
             const result = await this.itemNote.updateNoteContent(

@@ -15,6 +15,12 @@ interface MarkerType {
 const MARKER_REGISTRY: MarkerType[] = [
     { begPrefix: "ZF_NOTE_BEG_", endPrefix: "ZF_NOTE_END_", type: "NOTE" },
     { begPrefix: "ZF_ANNO_BEG_", endPrefix: "ZF_ANNO_END_", type: "ANNO" },
+    {
+        begPrefix: "ZF_ABSTRACT_BEG_",
+        endPrefix: "ZF_ABSTRACT_END_",
+        type: "ABSTRACT",
+    },
+    { begPrefix: "ZF_TAGS_BEG_", endPrefix: "ZF_TAGS_END_", type: "TAGS" },
     // Persist regions: user-owned local-only blocks. Editable like the
     // others, but NEVER synced back to Zotero (see scheduleSync).
     {
