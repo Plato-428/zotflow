@@ -117,10 +117,10 @@ async function seedArticle(
         libraryID: LIB,
         key,
         itemType: "journalArticle",
-        title: "A Study of Things",
+        title: (data.title as string) ?? "A Study of Things",
         citationKey: "doe2020",
         version: 7,
-        csljson: { id: key, type: "article-journal", title: "A Study of Things" },
+        csljson: { id: key, type: "article-journal", title: (data.title as string) ?? "A Study of Things" },
         raw: {
             key,
             version: 7,
@@ -271,7 +271,7 @@ describe("frontmatter", () => {
             "item-tree",
             "library-version",
         ]);
-        expect(keys.slice(6)).toEqual(["rating", "title", "status"]);
+        expect(keys.slice(6)).toEqual(["title", "status"]);
         expect(out).toContain("item-version: 7");
     });
 
@@ -317,12 +317,12 @@ describe("frontmatter", () => {
         expect(out).not.toContain("??");
     });
 
-    test("keys the template does not mention are carried over untouched", async () => {
+    test("keys the template does not mention are purged on render", async () => {
         const item = await seedArticle();
         const out = await service.renderLibrarySourceNote(item, "body", {
-            "my-own-field": "kept",
+            "my-own-field": "obsolete",
         });
-        expect(out).toContain("my-own-field: kept");
+        expect(out).not.toContain("my-own-field");
     });
 
     test("liquid runs inside the frontmatter block", async () => {
@@ -562,6 +562,28 @@ describe("item context", () => {
         );
         expect(body.trim()).toBe(
             "A Study of Things|2020|Journal of Testing|10.1000/test|doe2020",
+        );
+    });
+
+    test("plainTitle strips markdown and HTML marks while title preserves markdown", async () => {
+        const item = await seedArticle("PARENT_TITLE", {
+            title: "Plato's <i>Timaeus</i> and its **reception**",
+        });
+        const body = await render(
+            "Title: {{ item.title }}\nPlain: {{ item.plainTitle }}\nFilter: {{ item.title | strip_markdown }}",
+            item,
+        );
+        expect(body).toContain("Title: Plato's *Timaeus* and its **reception**");
+        expect(body).toContain("Plain: Plato's Timaeus and its reception");
+        expect(body).toContain("Filter: Plato's Timaeus and its reception");
+    });
+
+    test("list_tabs filter normalizes space-indented markdown lists to pure tabs", async () => {
+        const item = await seedArticle();
+        const template = `{{ "1. Top\\n   1. Sub\\n10. Top ten\\n    1. Sub under ten\\n       1. Deep" | list_tabs }}`;
+        const body = await render(template, item);
+        expect(body).toBe(
+            "1. Top\n\t1. Sub\n10. Top ten\n\t1. Sub under ten\n\t\t1. Deep",
         );
     });
 

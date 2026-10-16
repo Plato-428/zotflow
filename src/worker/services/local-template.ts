@@ -4,6 +4,8 @@ import type { ZotFlowSettings } from "settings/types";
 import type { AnnotationJSON } from "types/zotero-reader";
 import type { IParentProxy } from "bridge/types";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
+import { listToTabs } from "worker/convert/list-tabs";
+import { stripMarkdown } from "worker/convert/annotation-comment";
 import { getLocalSidecarPath } from "utils/utils";
 import { annoHtml2md } from "worker/convert";
 import type { AnnotationTemplateContext } from "types/template-context";
@@ -129,6 +131,20 @@ export class LocalTemplateService {
                 // markdown inside it renders raw in Reading view; `%%`
                 // markers avoid that but introduce stray blank lines.
                 return `<!-- ZF_${type}_BEG_${key} -->\n${input}\n<!-- ZF_${type}_END_${key} -->`;
+            },
+        );
+        this.engine.registerFilter("strip_markdown", (input: string) => {
+            if (!input) return "";
+            return stripMarkdown(input);
+        });
+        this.engine.registerFilter(
+            "list_tabs",
+            (input: string, indent?: string) => {
+                if (!input) return "";
+                return listToTabs(
+                    input,
+                    typeof indent === "string" ? indent : "\t",
+                );
             },
         );
         this.previewEngine = strictFilterEngine(this.engine, ENGINE_OPTIONS);

@@ -56,6 +56,13 @@ export interface ItemTemplateContext extends ItemMetadataContext {
 
     tags: Array<{ tag: string; type?: number }>;
 
+    /** Zotero Reading List status string (e.g. "📖 In Progress"), extracted from tags. */
+    readStatus?: string;
+    /** Ethereal Style star rating number (1-5), extracted from tags. */
+    rating?: number;
+    /** Plain text title with all Markdown formatting symbols stripped. */
+    plainTitle?: string;
+
     /** CSL-JSON payload from the Zotero API (synced with include=csljson). */
     csljson?: Record<string, unknown>;
 

@@ -36,6 +36,9 @@ import type {
     RenderOptions,
 } from "worker/csl";
 import { buildItemMetadata } from "utils/zotero-fields";
+import { splitSpecialTags } from "utils/special-tags";
+import { metaHtml2md, stripMarkdown } from "worker/convert/annotation-comment";
+import { listToTabs } from "worker/convert/list-tabs";
 import {
     mandatoryKeyHint,
     previewResult,
@@ -69,13 +72,19 @@ year: {{ item.year }}
 url: {{ item.url | json }}
 doi: {{ item.DOI | json }}
 tags: [{% for t in item.tags %}"#{{ t.tag | replace: " ", "_" }}"{% unless forloop.last %}, {% endunless %}{% endfor %}]
+{%- if item.readStatus %}
+read-status: "{{ item.readStatus }}"
+{%- endif %}
+{%- if item.rating %}
+rating: "{{ item.rating }}"
+{%- endif %}
 ---
 {%- capture quote_string %}{{ newline }}> {% endcapture -%}
 {%- capture quote_string_2 %}{{ newline }}> >{% endcapture -%}
 # {{ item.title }}
 {%- if item.abstractNote -%}
 ## Abstract
-> {{ item.abstractNote | replace: newline, quote_string }}
+> {{ item.abstractNote | wrap_editable: "ABSTRACT", item.key | replace: newline, quote_string }}
 
 {%- endif -%}
 {%- if item.attachments.length > 0 -%}
@@ -330,6 +339,20 @@ export class LibraryTemplateService {
                 // markdown inside it renders raw in Reading view; `%%`
                 // markers avoid that but introduce stray blank lines.
                 return `<!-- ZF_${type}_BEG_${key} -->\n${input}\n<!-- ZF_${type}_END_${key} -->`;
+            },
+        );
+        this.engine.registerFilter("strip_markdown", (input: string) => {
+            if (!input) return "";
+            return stripMarkdown(input);
+        });
+        this.engine.registerFilter(
+            "list_tabs",
+            (input: string, indent?: string) => {
+                if (!input) return "";
+                return listToTabs(
+                    input,
+                    typeof indent === "string" ? indent : "\t",
+                );
             },
         );
         this.engine.registerFilter("html2md", async (input: string) => {
@@ -964,8 +987,20 @@ export class LibraryTemplateService {
 
         const relatedItems = await this.mapToRelatedItems(data);
 
+        const { readStatus, rating, remaining: remainingTags } =
+            splitSpecialTags(data.tags || []);
+
+        const metadata = buildItemMetadata(item);
+        if (metadata.title) {
+            metadata.title = metaHtml2md(metadata.title);
+        }
+        if (metadata.abstractNote) {
+            metadata.abstractNote = metaHtml2md(metadata.abstractNote);
+        }
+
         return {
-            ...buildItemMetadata(item),
+            ...metadata,
+            plainTitle: stripMarkdown(item.title || metadata.title || ""),
             key: item.key,
             version: item.version,
             libraryID: item.libraryID,
@@ -979,7 +1014,9 @@ export class LibraryTemplateService {
             itemType: item.itemType,
             dateAdded: item.dateAdded,
             dateModified: item.dateModified,
-            tags: data.tags || [],
+            tags: remainingTags,
+            readStatus,
+            rating,
             csljson: item.csljson,
         };
     }
