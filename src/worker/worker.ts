@@ -1,4 +1,6 @@
 import * as Comlink from "comlink";
+import { EnhancementResourceService } from "./services/enhancement-resources";
+import { setProxiedFetch } from "./proxied-fetch";
 import { ZoteroAPIService } from "./services/zotero";
 import { SyncService } from "./services/sync";
 import { AttachmentService } from "./services/attachment";
@@ -6,19 +8,23 @@ import { WebDavService } from "./services/webdav";
 import { TreeViewService } from "./services/tree-view";
 import { LibraryTemplateService } from "./services/library-template";
 import { LibraryNoteService } from "./services/library-note";
-import { PDFProcessWorker } from "./services/pdf-processor";
+import { DocumentWorkerService } from "./services/document-worker";
 import { LocalNoteService } from "./services/local-note";
 import { LocalTemplateService } from "./services/local-template";
 import { ConflictService } from "./services/conflict";
+import { EditQueue } from "./services/edit-queue";
 import { AnnotationService } from "./services/annotation";
 import { KeyService } from "./services/key";
 import { LibraryService } from "./services/library";
 import { DbHelperService } from "./services/db-helper";
 import { SearchService } from "./services/search";
+import { SearchMatcher } from "./services/search-matcher";
+import { DisplayTitleService } from "./services/display-title";
 import { TagService } from "./services/tag";
 import { NotePathService } from "./services/note-path";
 import { ConvertService } from "./services/convert";
 import { ItemNoteService } from "./services/item-note";
+import { CslRenderWorkerService } from "./services/csl-render";
 import { TaskManager } from "./tasks/manager";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
 
@@ -33,8 +39,7 @@ import type {
 import type { IDBZoteroItem } from "types/db-schema";
 import type { AttachmentData } from "types/zotero-item";
 import type { AnnotationJSON } from "types/zotero-reader";
-import type { SaveAnnotationsResult } from "./services/annotation";
-import type { LibraryRow } from "./services/key";
+import type { DownloadedAttachment } from "types/tasks";
 import type { DbHelperService as DbHelperServiceType } from "./services/db-helper";
 import type { TagService as TagServiceType } from "./services/tag";
 
@@ -42,6 +47,14 @@ import type { TagService as TagServiceType } from "./services/tag";
  * Worker API definition
  * This interface defines the methods exposed by the worker
  */
+/**
+ * A worker service handed across the Comlink boundary. The getters below
+ * return `Comlink.proxy(...)`, so the value really is proxy-marked; declaring
+ * that is what makes `Remote<WorkerAPI>` type these as proxies whose methods
+ * return promises, rather than as values to be structured-cloned.
+ */
+type Exposed<T> = T & Comlink.ProxyMarked;
+
 export interface WorkerAPI {
     init(
         settings: ZotFlowSettings,
@@ -49,25 +62,30 @@ export interface WorkerAPI {
         blobUrls: Record<string, string>,
     ): void;
     dispose(): void;
-    zotero: ZoteroAPIService;
-    sync: SyncService;
-    attachment: AttachmentService;
-    webdav: WebDavService;
-    treeView: TreeViewService;
-    libraryNote: LibraryNoteService;
-    itemNote: ItemNoteService;
-    localNote: LocalNoteService;
-    conflict: ConflictService;
-    annotation: AnnotationService;
-    key: KeyService;
-    library: LibraryService;
-    dbHelper: DbHelperServiceType;
-    tag: TagServiceType;
-    pdfProcessor: PDFProcessWorker;
-    libraryTemplate: LibraryTemplateService;
-    localTemplate: LocalTemplateService;
-    notePath: NotePathService;
-    tasks: TaskManager;
+    zotero: Exposed<ZoteroAPIService>;
+    sync: Exposed<SyncService>;
+    attachment: Exposed<AttachmentService>;
+    webdav: Exposed<WebDavService>;
+    treeView: Exposed<TreeViewService>;
+    libraryNote: Exposed<LibraryNoteService>;
+    itemNote: Exposed<ItemNoteService>;
+    editQueue: Exposed<EditQueue>;
+    localNote: Exposed<LocalNoteService>;
+    conflict: Exposed<ConflictService>;
+    annotation: Exposed<AnnotationService>;
+    key: Exposed<KeyService>;
+    library: Exposed<LibraryService>;
+    dbHelper: Exposed<DbHelperServiceType>;
+    search: Exposed<SearchService>;
+    displayTitle: Exposed<DisplayTitleService>;
+    tag: Exposed<TagServiceType>;
+    documentWorker: Exposed<DocumentWorkerService>;
+    enhancementResources: Exposed<EnhancementResourceService>;
+    libraryTemplate: Exposed<LibraryTemplateService>;
+    localTemplate: Exposed<LocalTemplateService>;
+    notePath: Exposed<NotePathService>;
+    cslRender: Exposed<CslRenderWorkerService>;
+    tasks: Exposed<TaskManager>;
     updateSettings(settings: ZotFlowSettings): void;
 
     // Task factory methods
@@ -80,9 +98,10 @@ export interface WorkerAPI {
     createBatchExtractImagesTask(
         input: BatchExtractImagesInput,
     ): Promise<string>;
+    createBackfillCslJsonTask(): Promise<string>;
     downloadAttachment(
         attachmentItem: IDBZoteroItem<AttachmentData>,
-    ): Promise<Blob>;
+    ): Promise<DownloadedAttachment>;
     extractExternalAnnotations(
         items: ItemIdentifier[],
     ): Promise<AnnotationJSON[]>;
@@ -98,6 +117,7 @@ let _treeView: TreeViewService | undefined;
 let _template: LibraryTemplateService | undefined;
 let _libraryNote: LibraryNoteService | undefined;
 let _itemNote: ItemNoteService | undefined;
+let _editQueue: EditQueue | undefined;
 let _localNote: LocalNoteService | undefined;
 let _localTemplate: LocalTemplateService | undefined;
 let _conflict: ConflictService | undefined;
@@ -106,10 +126,14 @@ let _key: KeyService | undefined;
 let _library: LibraryService | undefined;
 let _dbHelper: DbHelperService | undefined;
 let _search: SearchService | undefined;
+let _matcher: SearchMatcher | undefined;
+let _displayTitle: DisplayTitleService | undefined;
 let _tag: TagService | undefined;
 let _notePath: NotePathService | undefined;
 let _convert: ConvertService | undefined;
-let _pdfProcessor: PDFProcessWorker | undefined;
+let _documentWorker: DocumentWorkerService | undefined;
+let _enhancementResources: EnhancementResourceService | undefined;
+let _cslRender: CslRenderWorkerService | undefined;
 let _taskManager: TaskManager | undefined;
 let _currentSettings: ZotFlowSettings | undefined;
 
@@ -123,7 +147,7 @@ function assertInitialized() {
         !_template ||
         !_libraryNote ||
         !_itemNote ||
-        !_pdfProcessor ||
+        !_documentWorker ||
         !_localNote ||
         !_localTemplate ||
         !_conflict ||
@@ -132,9 +156,11 @@ function assertInitialized() {
         !_library ||
         !_dbHelper ||
         !_search ||
+        !_displayTitle ||
         !_tag ||
         !_notePath ||
         !_convert ||
+        !_cslRender ||
         !_taskManager ||
         !_currentSettings
     ) {
@@ -152,14 +178,39 @@ const exposedApi: WorkerAPI = {
         parentHost: IParentProxy,
         blobUrls: Record<string, string>,
     ) => {
+        const started = performance.now();
+        const startedAt = new Date().toISOString();
+        let stageStarted = started;
+        const stageDurationMs: Record<string, number> = {};
+        const finishStage = (stage: string) => {
+            const finished = performance.now();
+            stageDurationMs[stage] = Number(
+                (finished - stageStarted).toFixed(2),
+            );
+            stageStarted = finished;
+        };
         // Patch global fetch to proxy through Obsidian Main Thread
-        (globalThis as any).originalFetch = (globalThis as any).fetch;
-        (globalThis as any).fetch = async (url: string, init?: RequestInit) => {
+        // The worker global has no `originalFetch`; we are adding it so the
+        // proxy can be unwound.
+        const workerGlobal = self as unknown as {
+            fetch: unknown;
+            originalFetch?: unknown;
+        };
+        workerGlobal.originalFetch = workerGlobal.fetch;
+        const proxiedFetchImpl = async (url: string, init?: RequestInit) => {
+            // Through `Headers`, so every value is a string:
+            // zotero-api-client sets the version headers as numbers, and
+            // requestUrl on iOS silently drops non-string values (an upload
+            // would lose its If-Unmodified-Since-Version).
+            const headers: Record<string, string> = {};
+            new Headers(init?.headers).forEach((value, name) => {
+                headers[name] = value;
+            });
             try {
                 const response = await parentHost.request({
                     url: url,
                     method: init?.method || "GET",
-                    headers: init?.headers as Record<string, string>,
+                    headers,
                     body: init?.body as string | ArrayBuffer,
                     throw: false, // We handle status codes in Services
                     contentType: "application/json",
@@ -187,18 +238,22 @@ const exposedApi: WorkerAPI = {
                 );
             }
         };
+        workerGlobal.fetch = proxiedFetchImpl;
+
+        // Also expose via module import (see proxied-fetch.ts) so worker
+        // code can use it without referencing lint-restricted globals.
+        setProxiedFetch(proxiedFetchImpl);
+        finishStage("Configure proxied fetch");
 
         try {
             _zotero = new ZoteroAPIService(settings.zoteroapikey);
             _library = new LibraryService(settings, parentHost);
-            _search = new SearchService();
-            _dbHelper = new DbHelperService(
-                settings,
-                parentHost,
-                _library,
-                _search,
-            );
+            _matcher = new SearchMatcher();
+            _displayTitle = new DisplayTitleService(settings, parentHost);
+            _dbHelper = new DbHelperService(settings, parentHost, _library);
+            _search = new SearchService(_matcher, _dbHelper, _displayTitle);
             _tag = new TagService(settings, parentHost);
+            finishStage("Create API, library, search and database services");
             _webdav = new WebDavService(settings, parentHost);
             _attachment = new AttachmentService(
                 _webdav,
@@ -211,16 +266,24 @@ const exposedApi: WorkerAPI = {
                 settings,
                 parentHost,
                 _library,
-                _search,
+                _matcher,
+                _displayTitle,
             );
+            finishStage("Create attachment, sync and tree services");
 
-            _pdfProcessor = new PDFProcessWorker(
+            _enhancementResources = new EnhancementResourceService();
+            _documentWorker = new DocumentWorkerService(
                 settings,
                 parentHost,
                 blobUrls,
+                _enhancementResources,
             );
             _notePath = new NotePathService(settings, _dbHelper);
             _convert = new ConvertService();
+            finishStage("Create document and conversion services");
+
+            _cslRender = new CslRenderWorkerService(settings);
+            finishStage("Create CSL service");
 
             _template = new LibraryTemplateService(
                 settings,
@@ -228,13 +291,15 @@ const exposedApi: WorkerAPI = {
                 _dbHelper,
                 _notePath,
                 _convert,
+                _cslRender,
+                _zotero,
             );
             _libraryNote = new LibraryNoteService(
                 settings,
                 _template,
                 parentHost,
                 _attachment,
-                _pdfProcessor,
+                _documentWorker,
                 _notePath,
             );
             _itemNote = new ItemNoteService(
@@ -251,22 +316,46 @@ const exposedApi: WorkerAPI = {
                 _localTemplate,
                 _notePath,
             );
+            finishStage("Create template and note services");
 
-            _conflict = new ConflictService(parentHost);
+            _conflict = new ConflictService(parentHost, settings, _convert);
 
             _annotation = new AnnotationService(
                 _libraryNote,
                 parentHost,
                 _convert,
             );
+            _editQueue = new EditQueue(parentHost, _itemNote, _annotation);
+            // A source note's render writes the edits it shows first.
+            _libraryNote.setBeforeRender((libraryID, key) =>
+                _editQueue!.flushFor(libraryID, key),
+            );
             _key = new KeyService(_zotero, parentHost);
 
             _taskManager = new TaskManager(parentHost);
 
             _currentSettings = settings;
+            finishStage("Create annotation, key and task services");
 
-            // Initialize PDF Worker
-            _pdfProcessor._init();
+            // Initialize the nested Document Worker.
+            _documentWorker._init();
+            finishStage("Start nested Document Worker (synchronous setup)");
+            // Measure inside this worker's clock and send one summary. The main
+            // thread's init RPC duration also includes scheduling and messaging;
+            // this summary excludes worker bundle evaluation before init arrives.
+            parentHost.log(
+                "debug",
+                "Worker initialization breakdown",
+                "WorkerBridge",
+                {
+                    startedAt,
+                    finishedAt: new Date().toISOString(),
+                    durationMs: Number(
+                        (performance.now() - started).toFixed(2),
+                    ),
+                    stageDurationMs,
+                },
+            );
 
             parentHost.log("info", "Services initialized.", "Worker");
         } catch (e) {
@@ -351,6 +440,16 @@ const exposedApi: WorkerAPI = {
         return Comlink.proxy(_itemNote);
     },
 
+    get editQueue() {
+        if (!_editQueue)
+            throw new ZotFlowError(
+                ZotFlowErrorCode.UNKNOWN,
+                "Worker",
+                "Worker not initialized",
+            );
+        return Comlink.proxy(_editQueue);
+    },
+
     get localNote() {
         if (!_localNote)
             throw new ZotFlowError(
@@ -411,6 +510,26 @@ const exposedApi: WorkerAPI = {
         return Comlink.proxy(_dbHelper);
     },
 
+    get search() {
+        if (!_search)
+            throw new ZotFlowError(
+                ZotFlowErrorCode.UNKNOWN,
+                "Worker",
+                "Worker not initialized",
+            );
+        return Comlink.proxy(_search);
+    },
+
+    get displayTitle() {
+        if (!_displayTitle)
+            throw new ZotFlowError(
+                ZotFlowErrorCode.UNKNOWN,
+                "Worker",
+                "Worker not initialized",
+            );
+        return Comlink.proxy(_displayTitle);
+    },
+
     get tag() {
         if (!_tag)
             throw new ZotFlowError(
@@ -421,14 +540,19 @@ const exposedApi: WorkerAPI = {
         return Comlink.proxy(_tag);
     },
 
-    get pdfProcessor() {
-        if (!_pdfProcessor)
+    get enhancementResources() {
+        if (!_enhancementResources) throw new Error("Worker not initialized");
+        return Comlink.proxy(_enhancementResources);
+    },
+
+    get documentWorker() {
+        if (!_documentWorker)
             throw new ZotFlowError(
                 ZotFlowErrorCode.UNKNOWN,
                 "Worker",
                 "Worker not initialized",
             );
-        return Comlink.proxy(_pdfProcessor);
+        return Comlink.proxy(_documentWorker);
     },
 
     get tasks() {
@@ -471,9 +595,24 @@ const exposedApi: WorkerAPI = {
         return Comlink.proxy(_notePath);
     },
 
+    get cslRender() {
+        if (!_cslRender)
+            throw new ZotFlowError(
+                ZotFlowErrorCode.UNKNOWN,
+                "Worker",
+                "Worker not initialized",
+            );
+        return Comlink.proxy(_cslRender);
+    },
+
     dispose: () => {
+        _editQueue?.dispose();
+        _displayTitle?.dispose();
         _libraryNote?.dispose();
         _localNote?.dispose();
+        _cslRender?.dispose();
+        _documentWorker?.dispose();
+        _enhancementResources?.dispose();
     },
 
     /* ================================================================ */
@@ -482,11 +621,13 @@ const exposedApi: WorkerAPI = {
 
     createSyncTask: async (libraryId?: number) => {
         assertInitialized();
+        // The sync uploads the edits still waiting, not the text before them.
+        await _editQueue!.flushAll();
         return _taskManager!.createSyncTask(
             _sync!,
             libraryId,
-            _libraryNote!,
-            _currentSettings!,
+            _libraryNote,
+            _currentSettings,
         );
     },
 
@@ -508,10 +649,15 @@ const exposedApi: WorkerAPI = {
         assertInitialized();
         return _taskManager!.createBatchExtractImagesTask(
             _attachment!,
-            _pdfProcessor!,
+            _documentWorker!,
             _currentSettings!,
             input,
         );
+    },
+
+    createBackfillCslJsonTask: async () => {
+        assertInitialized();
+        return _taskManager!.createBackfillCslJsonTask(_zotero!);
     },
 
     downloadAttachment: async (
@@ -528,7 +674,8 @@ const exposedApi: WorkerAPI = {
         assertInitialized();
         return _taskManager!.createBatchExtractExternalAnnotationsTask(
             _attachment!,
-            _pdfProcessor!,
+            _documentWorker!,
+            _libraryNote!,
             { items },
         );
     },
@@ -546,6 +693,8 @@ const exposedApi: WorkerAPI = {
         _webdav!.updateSettings(settings);
         _attachment!.updateSettings(settings);
         _sync!.updateSettings(settings);
+        _conflict!.updateSettings(settings);
+        _displayTitle!.updateSettings(settings);
         _treeView!.updateSettings(settings);
         _library!.updateSettings(settings);
         _template!.updateSettings(settings);
@@ -556,7 +705,8 @@ const exposedApi: WorkerAPI = {
         _notePath!.updateSettings(settings);
         _dbHelper!.updateSettings(settings);
         _tag!.updateSettings(settings);
-        _pdfProcessor!.updateSettings(settings);
+        _documentWorker!.updateSettings(settings);
+        _cslRender!.updateSettings(settings);
         _currentSettings = settings;
     },
 };

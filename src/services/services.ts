@@ -1,10 +1,16 @@
+import { EnhancementPackService } from "services/enhancement-pack-service";
+import { workerBridge } from "bridge";
+import { sdtCompatibility } from "enhancement-pack/compatibility";
 import { IndexService } from "./index-service";
 import { LogService } from "./log-service";
 import { NotificationService } from "./notification-service";
 import { ViewStateService } from "./view-state-service";
 import { TaskMonitor } from "./task-monitor";
+import { EventHub } from "./event-hub";
 import { CitationService } from "./citation-service";
 import { LibraryCache } from "./library-cache";
+import { ReaderDocumentCache } from "./reader-document-cache";
+import { PendingEdits } from "./pending-edits";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
 
 import type { App } from "obsidian";
@@ -22,8 +28,12 @@ class ServiceLocator {
     private _notificationService: NotificationService;
     private _viewStateService: ViewStateService;
     private _taskMonitor: TaskMonitor;
+    private _eventHub: EventHub;
     private _citationService: CitationService;
     private _libraryCache: LibraryCache;
+    private _readerDocumentCache: ReaderDocumentCache;
+    private _pendingEdits: PendingEdits;
+    private _enhancementPack: EnhancementPackService;
 
     initialize(plugin: ZotFlow, settings: ZotFlowSettings) {
         this._plugin = plugin;
@@ -40,11 +50,33 @@ class ServiceLocator {
         this._indexService = new IndexService(this._app, this._logService);
         this._indexService.load();
 
-        this._taskMonitor = new TaskMonitor(this._app);
+        this._eventHub = new EventHub();
+        this._taskMonitor = new TaskMonitor(this._app, this._eventHub);
         this._citationService = new CitationService();
         this._libraryCache = new LibraryCache(
             () => this._settings,
             this._logService,
+        );
+        this._readerDocumentCache = new ReaderDocumentCache();
+        this._pendingEdits = new PendingEdits(this._logService);
+        this._enhancementPack = new EnhancementPackService(
+            this._app.vault.adapter,
+            this._app.vault.configDir,
+            sdtCompatibility,
+            () => workerBridge.enhancementResources,
+            (error) =>
+                this._logService.error(
+                    "Resource snapshot cleanup failed",
+                    "EnhancementPackService",
+                    error,
+                ),
+            (message, details) =>
+                this._logService.log(
+                    "debug",
+                    message,
+                    "EnhancementPackService",
+                    details,
+                ),
         );
 
         this._initialized = true;
@@ -114,6 +146,11 @@ class ServiceLocator {
         return this._taskMonitor;
     }
 
+    get eventHub() {
+        this.assertInitialized();
+        return this._eventHub;
+    }
+
     get citationService() {
         this.assertInitialized();
         return this._citationService;
@@ -122,6 +159,21 @@ class ServiceLocator {
     get libraryCache() {
         this.assertInitialized();
         return this._libraryCache;
+    }
+
+    get enhancementPack() {
+        this.assertInitialized();
+        return this._enhancementPack;
+    }
+
+    get readerDocumentCache() {
+        this.assertInitialized();
+        return this._readerDocumentCache;
+    }
+
+    get pendingEdits() {
+        this.assertInitialized();
+        return this._pendingEdits;
     }
 }
 

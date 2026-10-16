@@ -1,13 +1,9 @@
-import * as Comlink from "comlink";
 import {
     addIcon,
-    App,
     Component,
-    Editor,
     MarkdownRenderer,
     MarkdownView,
     Menu,
-    Modal,
     Plugin,
     TFile,
     TAbstractFile,
@@ -18,6 +14,7 @@ import {
 import { ZotFlowSettingTab } from "./settings/settings";
 import { DEFAULT_SETTINGS } from "./settings/types";
 import { workerBridge } from "./bridge";
+import { installTestHooks } from "dev/test-hooks";
 import { revokeBlobUrls } from "bundle-assets/inline-assets";
 import {
     saveCredentials,
@@ -27,9 +24,12 @@ import {
 import { ZOTERO_READER_VIEW_TYPE, ZoteroReaderView } from "./ui/reader/view";
 import { TREE_VIEW_TYPE, ZotFlowTreeView } from "./ui/tree-view/view";
 import { services } from "./services/services";
+import { errorMessage as describeError } from "utils/error";
 import { ZotFlowLockExtension } from "ui/editor/zotflow-lock-extension";
 import { ZotFlowEditableRegionExtension } from "ui/editor/zotflow-editable-region-extension";
 import { handleEditorDrop } from "ui/editor/citation-helper";
+import { startSync } from "ui/start-sync";
+import { promptNoteGone } from "ui/modals/note-gone-modal";
 
 import { openAttachment, openItemNote } from "utils/viewer";
 import { getLocalSidecarPath } from "utils/utils";
@@ -38,6 +38,7 @@ import { checkFile, readTextFile, renameFile, deleteFile } from "utils/file";
 import { ActivityCenterModal } from "ui/activity-center/modal";
 import { ZoteroSearchModal } from "ui/modals/suggest";
 import { AttachmentSelectModal } from "ui/modals/attachment-suggest";
+import { CslFolderService } from "services/csl-folder-service";
 
 import type {
     ZotFlowSettings,
@@ -54,38 +55,103 @@ import {
     LocalReaderView,
 } from "ui/reader/local-view";
 import { NOTE_EDITOR_VIEW_TYPE, NoteEditorView } from "ui/note-editor/view";
-import { ZotFlowCommentExtension } from "ui/editor/zotflow-comment-extension";
 import { ZotFlowRegionDecorationExtension } from "ui/editor/zotflow-region-decoration-extension";
 import { CitationSuggest } from "ui/editor/citation-suggest";
+import { fireAndForgetIn } from "utils/fire-and-forget";
+import { focusReaderLeaf } from "utils/reader-leaf-navigation";
 
 const SUPPORTED_EXTENSIONS = ["pdf", "epub", "html"];
 
 /** Plugin entry point managing lifecycle, commands, views, settings, and protocol handlers. */
+const ff = fireAndForgetIn("ZotFlow");
+
 export default class ZotFlow extends Plugin {
     settings: ZotFlowSettings;
     viewStates: Record<string, ViewStateEntry>;
     customThemes: CustomReaderTheme[] = [];
+    cslFolder: CslFolderService;
+    private zotFlowSettingTab: ZotFlowSettingTab | undefined;
     private citationSuggest: CitationSuggest;
     private sourceNoteActionElements = new WeakMap<MarkdownView, HTMLElement>();
     private tagFieldDebouncers = new Map<string, ReturnType<typeof setTimeout>>();
 
     async onload() {
+        const startupStarted = performance.now();
+        const startupStartedAt = Date.now();
+        let stageStarted = startupStarted;
+        const logTiming = (
+            stage: string,
+            started: number,
+            finished: number,
+        ) => {
+            services.logService.debug(stage, "Startup", {
+                startedAt: new Date(
+                    startupStartedAt + started - startupStarted,
+                ).toISOString(),
+                finishedAt: new Date(
+                    startupStartedAt + finished - startupStarted,
+                ).toISOString(),
+                durationMs: Number((finished - started).toFixed(2)),
+                elapsedMs: Number((finished - startupStarted).toFixed(2)),
+            });
+        };
+        const finishStage = (stage: string, finished = performance.now()) => {
+            logTiming(stage, stageStarted, finished);
+            stageStarted = finished;
+        };
+        // Deferred tasks can overlap onload and each other. Measure them separately
+        // without awaiting them or advancing the sequential startup checkpoints.
+        const timeBackground = async (
+            stage: string,
+            run: () => Promise<unknown>,
+        ) => {
+            const started = performance.now();
+            let completed = false;
+            try {
+                await run();
+                completed = true;
+            } finally {
+                logTiming(
+                    `Background: ${stage} ${completed ? "completed" : "failed"}`,
+                    started,
+                    performance.now(),
+                );
+            }
+        };
+
         // Load settings
         await this.loadSettings();
         this.applyEditableRegionMarkerVisibility();
+        const settingsLoaded = performance.now();
 
         // Initialize local services
         services.initialize(this, this.settings);
         services.viewStateService.setViewStates(this.viewStates);
         services.viewStateService.setCustomThemes(this.customThemes);
+        const servicesInitialized = performance.now();
+        // LogService only exists after initialization; retain the earlier boundaries.
+        services.logService.debug("onload started", "Startup", {
+            startedAt: new Date(startupStartedAt).toISOString(),
+        });
+        finishStage("Load settings", settingsLoaded);
+        finishStage("Initialize main-thread services", servicesInitialized);
 
         // Initialize worker bridge
+        let workerStage = "Initialize worker bridge";
         try {
             await workerBridge.initialize(this.settings, this.app);
+            installTestHooks(this, {
+                bridge: workerBridge,
+                parentHost: workerBridge.parentHost,
+            });
+            finishStage(workerStage);
+            workerStage = "Refresh library capabilities";
             // Now that the worker is ready, populate per-library capabilities
             // (notes/write access). Used by UI gates and the lock extension.
             await services.libraryCache.refresh();
+            finishStage(workerStage);
         } catch (e) {
+            finishStage(`${workerStage} failed`);
             services.logService.error(
                 "Failed to initialize worker bridge",
                 "Main",
@@ -99,6 +165,7 @@ export default class ZotFlow extends Plugin {
 
         // Add Icons
         this.addIcons();
+        finishStage("Register icons");
 
         // Register views
         this.registerView(
@@ -116,9 +183,15 @@ export default class ZotFlow extends Plugin {
         );
 
         // Add tree view to left
-        this.app.workspace.onLayoutReady(async () => {
-            this.registerTreeView();
+        this.app.workspace.onLayoutReady(() => {
+            ff(
+                timeBackground("Register tree view", () =>
+                    this.registerTreeView(),
+                ),
+                "Failed to register the tree view",
+            );
         });
+        finishStage("Register views and layout callback");
 
         // this.registerEvent(
         //     this.app.workspace.on("file-open", this.handleFileOpen.bind(this)),
@@ -149,6 +222,7 @@ export default class ZotFlow extends Plugin {
         // Register citation suggest
         this.citationSuggest = new CitationSuggest();
         this.registerEditorSuggest(this.citationSuggest);
+        finishStage("Register editor extensions and citation handlers");
 
         // Register protocol handler for zotflow URIs
         // Usage: obsidian://zotflow?filePath=path/to/file.md
@@ -159,7 +233,6 @@ export default class ZotFlow extends Plugin {
 
         if (this.settings.overwriteViewer) {
             try {
-                // @ts-expect-error Undocumented Obsidian API: unregisterExtensions()
                 this.app.viewRegistry.unregisterExtensions(
                     SUPPORTED_EXTENSIONS,
                 );
@@ -168,7 +241,7 @@ export default class ZotFlow extends Plugin {
                     LOCAL_ZOTERO_READER_VIEW_TYPE,
                 );
             } catch {
-                const message = `Could not unregister extension: '${SUPPORTED_EXTENSIONS}'`;
+                const message = `Could not unregister extension: '${SUPPORTED_EXTENSIONS.join(", ")}'`;
                 services.logService.error(message, "Main");
                 // services.notificationService.notify("error", message);
             }
@@ -187,16 +260,26 @@ export default class ZotFlow extends Plugin {
             }
         }
 
-        // Ensure MathJax is loaded
+        finishStage("Register protocol and file extensions");
+
+        // Ensure MathJax is loaded. The output is thrown away — this only
+        // exists to make Obsidian load the library — so a failure means the
+        // warm-up did not happen and nothing more.
         const tempComponent = new Component();
-        MarkdownRenderer.render(
-            this.app,
-            "$\\int$",
-            document.createElement("div"),
-            "",
-            tempComponent,
+        ff(
+            timeBackground("MathJax warm-up", () =>
+                MarkdownRenderer.render(
+                    this.app,
+                    "$\\int$",
+                    createDiv(),
+                    "",
+                    tempComponent,
+                ),
+            ),
+            "Failed to warm up MathJax",
         );
         tempComponent.unload();
+        finishStage("Schedule MathJax warm-up");
 
         this.addRibbonIcon(
             "zotero-icon",
@@ -210,13 +293,16 @@ export default class ZotFlow extends Plugin {
             id: "open-tree-view",
             name: "Open Zotero Tree View",
             callback: () => {
-                this.registerTreeView(true);
+                ff(
+                    this.registerTreeView(true),
+                    "Failed to register the tree view",
+                );
             },
         });
 
         this.addCommand({
             id: "open-activity-center",
-            name: "Open ZotFlow Activity Center",
+            name: "Open Activity Center",
             callback: () => {
                 new ActivityCenterModal(this.app).open();
             },
@@ -227,7 +313,7 @@ export default class ZotFlow extends Plugin {
             name: "Sync all libraries",
             callback: async () => {
                 await this.runTaskCommand(
-                    () => workerBridge.createSyncTask(),
+                    () => startSync(),
                     "Sync started",
                     "Failed to start sync",
                 );
@@ -294,6 +380,18 @@ export default class ZotFlow extends Plugin {
         });
 
         this.addCommand({
+            id: "update-all-csl-data",
+            name: "Update CSL citation data for all items",
+            callback: async () => {
+                await this.runTaskCommand(
+                    () => workerBridge.createBackfillCslJsonTask(),
+                    "CSL citation data update started",
+                    "Failed to start CSL citation data update",
+                );
+            },
+        });
+
+        this.addCommand({
             id: "extract-all-annotation-images",
             name: "Extract all annotation images from attachments",
             callback: async () => {
@@ -326,7 +424,7 @@ export default class ZotFlow extends Plugin {
             editorCallback: () => {
                 this.citationSuggest.triggerManually();
             },
-            hotkeys: [{ modifiers: ["Alt"], key: "c" }],
+            // hotkeys: [{ modifiers: ["Alt"], key: "c" }],
         });
 
         this.addCommand({
@@ -345,8 +443,8 @@ export default class ZotFlow extends Plugin {
 
                 const cache = this.app.metadataCache.getFileCache(view.file);
                 const fm = cache?.frontmatter;
-                const zoteroKey = fm?.["zotero-key"];
-                const libraryID = fm?.["library-id"];
+                const zoteroKey: unknown = fm?.["zotero-key"];
+                const libraryID: unknown = fm?.["library-id"];
 
                 if (
                     typeof zoteroKey !== "string" ||
@@ -406,7 +504,7 @@ export default class ZotFlow extends Plugin {
                 } catch (e) {
                     services.notificationService.notify(
                         "error",
-                        `Failed to start task: ${e}`,
+                        `Failed to start task: ${String(e)}`,
                     );
                     services.logService.error(
                         "Failed to start test task",
@@ -417,13 +515,21 @@ export default class ZotFlow extends Plugin {
             },
         });
 
-        this.addSettingTab(new ZotFlowSettingTab(this.app, this));
+        finishStage("Register commands and ribbon actions");
+
+        this.zotFlowSettingTab = new ZotFlowSettingTab(this.app, this);
+        this.addSettingTab(this.zotFlowSettingTab);
+        finishStage("Register settings tab");
+
+        // An edit that reached a note deleted in Zotero: offer its text.
+        this.register(services.eventHub.noteGone.subscribe(promptNoteGone));
 
         // Track file renames to keep viewStates and .zf.json sidecar in sync
         this.registerEvent(
             this.app.vault.on("rename", (file, oldPath) => {
                 services.viewStateService.renameViewState(oldPath, file.path);
                 this.handleSidecarRename(file, oldPath);
+                void this.cslFolder.onRename(file, oldPath);
             }),
         );
 
@@ -432,8 +538,33 @@ export default class ZotFlow extends Plugin {
             this.app.vault.on("delete", (file) => {
                 services.viewStateService.deleteViewState(file.path);
                 this.handleSidecarDelete(file);
+                void this.cslFolder.onDelete(file);
             }),
         );
+
+        // Hot-load custom CSL styles/locales from the configured vault folder.
+        // create/modify are registered after layout-ready: "create" fires for
+        // every existing file during startup indexing otherwise.
+        this.cslFolder = new CslFolderService(this.app.vault);
+        this.cslFolder.setFolder(this.settings.cslStylesFolder);
+        this.app.workspace.onLayoutReady(() => {
+            ff(
+                timeBackground("Scan CSL folder", () =>
+                    this.cslFolder.rescan(),
+                ),
+                "Failed to scan CSL folder",
+            );
+            this.registerEvent(
+                this.app.vault.on("create", (file) => {
+                    void this.cslFolder.onCreateOrModify(file);
+                }),
+            );
+            this.registerEvent(
+                this.app.vault.on("modify", (file) => {
+                    void this.cslFolder.onCreateOrModify(file);
+                }),
+            );
+        });
 
         // Add right-click "Update source note" entries for source notes
         this.registerEvent(
@@ -449,10 +580,21 @@ export default class ZotFlow extends Plugin {
                 this.handleSourceNoteMetadataChanged.bind(this),
             ),
         );
+        finishStage("Register vault events and CSL layout callback");
+        // Wall-clock onload time includes awaited worker/I/O time, not just CPU
+        // execution. It excludes bundle parsing before onload and does not wait
+        // for deferred work, whose duration may overlap this total.
+        logTiming(
+            "onload completed (total)",
+            startupStarted,
+            performance.now(),
+        );
     }
 
     onunload() {
         services.viewStateService.flushViewStateSave();
+        services.readerDocumentCache.dispose();
+        services.enhancementPack.dispose();
         for (const timer of this.tagFieldDebouncers.values()) {
             clearTimeout(timer);
         }
@@ -505,6 +647,12 @@ export default class ZotFlow extends Plugin {
             <defs><mask maskUnits="userSpaceOnUse" id="a"><g style="display:inline"><path fill="#fff" d="M0 0h100v100H0z"/><circle cx="64.5" cy="68.25" r="28"/><path stroke="#000" stroke-width="26" stroke-linecap="round" style="stroke-width:40;stroke-dasharray:none" d="m70 70 30 30"/></g></mask></defs><path mask="url(#a)" style="fill:none;stroke:currentColor;stroke-width:8.33331;stroke-linecap:round;stroke-linejoin:round" d="M17.214 8.333H82.28l5.219 9.839L42.803 74.26h44.36v17.407H17.551L12.5 81.155l44.107-55.163H17.046Z"/><g transform="matrix(2.5 0 0 2.5 37 40.75)"><circle cx="11" cy="11" r="8" style="fill:none;stroke:currentColor;stroke-width:3.33;stroke-linecap:round;stroke-linejoin:round"/><path d="m21 21-4.34-4.34" style="fill:none;stroke:currentColor;stroke-width:3.33;stroke-linecap:round;stroke-linejoin:round"/></g>
             `,
         );
+        // Brand zf mark (micro outline), drawn on a 24×24 grid like Lucide.
+        // No stroke-width here: it inherits the user's --icon-stroke.
+        addIcon(
+            "zotflow-logo",
+            `<g transform="scale(4.1666667)" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M2,9.236 L11.691,9.236 L4.062,18.308 L10.041,18.308"/><path d="M13.546,21.195 L17.258,5.525 C18.082,2.638 20.144,2.226 22,3.463"/><path d="M11.485,9.236 L21.381,9.236"/></g>`,
+        );
     }
 
     async registerTreeView(active = false) {
@@ -527,7 +675,7 @@ export default class ZotFlow extends Plugin {
             }
         }
 
-        if (leaf && active) workspace.revealLeaf(leaf);
+        if (leaf && active) void workspace.revealLeaf(leaf);
     }
 
     async loadSettings() {
@@ -548,6 +696,29 @@ export default class ZotFlow extends Plugin {
 
         // Load sensitive credentials from SecretStorage (cross-platform safe)
         loadCredentials(this.settings, this.app.secretStorage);
+    }
+
+    async onExternalSettingsChange() {
+        await this.loadSettings();
+        workerBridge.updateSettings(this.settings);
+        services.updateSettings(this.settings);
+        services.viewStateService.setViewStates(this.viewStates);
+        services.viewStateService.setCustomThemes(this.customThemes);
+        if (this.cslFolder) {
+            this.cslFolder.setFolder(this.settings.cslStylesFolder);
+            await this.cslFolder.rescan();
+        }
+        this.applyEditableRegionMarkerVisibility();
+        this.zotFlowSettingTab?.refreshFromSettings();
+    }
+
+    /**
+     * Re-render the settings tab after a setting was changed elsewhere (e.g.
+     * the template tester). Only re-renders: `refreshFromSettings()` would
+     * also reset the sections, dropping e.g. an API key being typed in.
+     */
+    refreshSettingTab(): void {
+        this.zotFlowSettingTab?.update();
     }
 
     async saveSettings() {
@@ -575,6 +746,32 @@ export default class ZotFlow extends Plugin {
         document.body.classList.toggle(
             "zotflow-hide-region-markers",
             this.settings.hideEditableRegionMarkers,
+        );
+    }
+
+    /** Open an annotation's attachment, navigated to the annotation. */
+    private async openAnnotation(libID: number, key: string) {
+        const annotation = await workerBridge.dbHelper.getItem(libID, key);
+        if (!annotation || annotation.itemType !== "annotation") {
+            services.notificationService.notify(
+                "warning",
+                "Annotation not found.",
+            );
+            return;
+        }
+        const attachmentKey = annotation.parentItem;
+        if (!attachmentKey) {
+            services.notificationService.notify(
+                "warning",
+                "Annotation has no parent attachment.",
+            );
+            return;
+        }
+        await openAttachment(
+            libID,
+            attachmentKey,
+            this.app,
+            JSON.stringify({ annotationID: key }),
         );
     }
 
@@ -611,37 +808,33 @@ export default class ZotFlow extends Plugin {
             }
 
             if (type === "open-note") {
-                await workerBridge.libraryNote.openNote(libID, key);
+                // Converted zotero://select links name any item. Only a
+                // top-level regular item or standalone attachment has a
+                // source note; anything else is shown as what it is.
+                const target = await workerBridge.dbHelper.getItem(libID, key);
+                if (!target) {
+                    services.notificationService.notify(
+                        "warning",
+                        "Item not found.",
+                    );
+                } else if (target.itemType === "note") {
+                    await openItemNote(libID, key, this.app);
+                } else if (target.itemType === "annotation") {
+                    await this.openAnnotation(libID, key);
+                } else if (target.parentItem) {
+                    await openAttachment(libID, key, this.app, navigation);
+                } else {
+                    await workerBridge.libraryNote.openNote(libID, key);
+                }
+            } else if (type === "open-item-note") {
+                // Child note links (e.g. converted Better Notes
+                // zotero://note links) — openItemNote honors the
+                // alwaysOpenChildNoteInEditor setting.
+                await openItemNote(libID, key, this.app);
             } else if (type === "open-attachment") {
                 await openAttachment(libID, key, this.app, navigation);
             } else if (type === "open-annotation") {
-                // Locate the annotation by key, then open its parent attachment
-                // navigated to the annotation. Only the annotation id is needed.
-                const annotation = await workerBridge.dbHelper.getItem(
-                    libID,
-                    key,
-                );
-                if (!annotation || annotation.itemType !== "annotation") {
-                    services.notificationService.notify(
-                        "warning",
-                        "Annotation not found.",
-                    );
-                    return;
-                }
-                const attachmentKey = annotation.parentItem;
-                if (!attachmentKey) {
-                    services.notificationService.notify(
-                        "warning",
-                        "Annotation has no parent attachment.",
-                    );
-                    return;
-                }
-                await openAttachment(
-                    libID,
-                    attachmentKey,
-                    this.app,
-                    JSON.stringify({ annotationID: key }),
-                );
+                await this.openAnnotation(libID, key);
             } else {
                 services.logService.log(
                     "warn",
@@ -653,7 +846,7 @@ export default class ZotFlow extends Plugin {
                     `Unknown action type: ${type}`,
                 );
             }
-        } catch (error: any) {
+        } catch (error) {
             services.logService.log(
                 "error",
                 "Error handling zotflow protocol call",
@@ -664,7 +857,7 @@ export default class ZotFlow extends Plugin {
             // Handle typed errors from Worker
             services.notificationService.notify(
                 "error",
-                `Protocol Error: ${error.message || "Unknown error"}`,
+                `Protocol Error: ${describeError(error) || "Unknown error"}`,
             );
         }
     }
@@ -826,9 +1019,9 @@ export default class ZotFlow extends Plugin {
         const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
         if (!fm) return;
 
-        const zoteroKey = fm["zotero-key"];
-        const libraryID = fm["library-id"];
-        const localAttachment = fm["zotflow-local-attachment"];
+        const zoteroKey: unknown = fm["zotero-key"];
+        const libraryID: unknown = fm["library-id"];
+        const localAttachment: unknown = fm["zotflow-local-attachment"];
 
         const isLibrarySourceNote =
             typeof zoteroKey === "string" && typeof libraryID === "number";
@@ -843,8 +1036,8 @@ export default class ZotFlow extends Plugin {
                     .onClick(async () => {
                         try {
                             await workerBridge.libraryNote.triggerUpdate(
-                                libraryID as number,
-                                zoteroKey as string,
+                                libraryID,
+                                zoteroKey,
                                 {},
                                 false,
                             );
@@ -872,8 +1065,8 @@ export default class ZotFlow extends Plugin {
                     .onClick(async () => {
                         try {
                             await workerBridge.libraryNote.triggerUpdate(
-                                libraryID as number,
-                                zoteroKey as string,
+                                libraryID,
+                                zoteroKey,
                                 {
                                     forceUpdateContent: true,
                                     forceUpdateImages: true,
@@ -898,7 +1091,7 @@ export default class ZotFlow extends Plugin {
                     });
             });
 
-            if (services.libraryCache.canEditNotes(libraryID as number)) {
+            if (services.libraryCache.canEditNotes(libraryID)) {
                 menu.addItem((item) => {
                     item.setTitle("ZotFlow: Create child note")
                         .setIcon("sticky-note")
@@ -906,16 +1099,16 @@ export default class ZotFlow extends Plugin {
                             try {
                                 const noteKey =
                                     await workerBridge.itemNote.createChildNote(
-                                        libraryID as number,
-                                        zoteroKey as string,
+                                        libraryID,
+                                        zoteroKey,
                                     );
                                 await workerBridge.libraryNote.triggerUpdate(
-                                    libraryID as number,
-                                    zoteroKey as string,
+                                    libraryID,
+                                    zoteroKey,
                                     { forceUpdateContent: true },
                                 );
                                 await openItemNote(
-                                    libraryID as number,
+                                    libraryID,
                                     noteKey,
                                     this.app,
                                 );
@@ -940,7 +1133,7 @@ export default class ZotFlow extends Plugin {
                     .onClick(async () => {
                         await this.updateLocalSourceNoteFromMenu(
                             file,
-                            localAttachment as string,
+                            localAttachment,
                         );
                     });
             });
@@ -1140,9 +1333,9 @@ export default class ZotFlow extends Plugin {
         const cache = this.app.metadataCache.getFileCache(file);
         const fm = cache?.frontmatter;
 
-        const zoteroKey = fm?.["zotero-key"];
-        const libraryID = fm?.["library-id"];
-        const localAttachment = fm?.["zotflow-local-attachment"];
+        const zoteroKey: unknown = fm?.["zotero-key"];
+        const libraryID: unknown = fm?.["library-id"];
+        const localAttachment: unknown = fm?.["zotflow-local-attachment"];
 
         const isLibrarySourceNote =
             typeof zoteroKey === "string" && typeof libraryID === "number";
@@ -1164,8 +1357,8 @@ export default class ZotFlow extends Plugin {
             async () => {
                 if (isLibrarySourceNote) {
                     await this.openLibrarySourceNoteAttachment(
-                        libraryID as number,
-                        zoteroKey as string,
+                        libraryID,
+                        zoteroKey,
                     );
                 } else {
                     await this.openLocalSourceNoteAttachment(
@@ -1258,14 +1451,13 @@ export default class ZotFlow extends Plugin {
                     dest.path,
             );
         if (existing) {
-            this.app.workspace.setActiveLeaf(existing);
-            this.app.workspace.revealLeaf(existing);
+            await focusReaderLeaf(this.app.workspace, existing);
             return;
         }
 
         const leaf = this.app.workspace.getLeaf("tab");
         await leaf.openFile(dest);
-        this.app.workspace.revealLeaf(leaf);
+        await focusReaderLeaf(this.app.workspace, leaf);
     }
 
     async handleFileOpen(file: TFile | null) {
@@ -1293,9 +1485,12 @@ export default class ZotFlow extends Plugin {
                         },
                     };
 
-                    setTimeout(async () => {
+                    window.setTimeout(() => {
                         if (leaf.view instanceof MarkdownView) {
-                            await leaf.setViewState(newState);
+                            ff(
+                                leaf.setViewState(newState),
+                                "Failed to restore the note view state",
+                            );
                         }
                     }, 10);
                 }

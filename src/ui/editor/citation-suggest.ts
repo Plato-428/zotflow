@@ -16,17 +16,19 @@ import {
     type SuggestionItem,
 } from "ui/modals/zotero-item-suggest";
 import { insertCitationResult } from "ui/editor/citation-helper";
+import { LatestOnly } from "utils/latest-only";
 
 const DEFAULT_TRIGGER = "@@";
 
 /**
  * Inline EditorSuggest for inserting Zotero citations.
  * Auto-triggers when the user types the configured trigger (default `@@`) in the editor.
- * Also triggered via the "Insert Citation" command (Alt+C).
+ * Also triggered via the "Insert Citation" command.
  */
 export class CitationSuggest extends EditorSuggest<SuggestionItem> {
     private manualTriggerStart: EditorPosition | null = null;
     private readonly suggest = new ZoteroItemSuggest();
+    private readonly latest = new LatestOnly();
 
     private resolveInsertionAnchor(
         editor: Editor,
@@ -84,8 +86,7 @@ export class CitationSuggest extends EditorSuggest<SuggestionItem> {
         view.editor.replaceRange(t, cursor);
         view.editor.setCursor({ line: cursor.line, ch: cursor.ch + t.length });
         this.manualTriggerStart = cursor;
-        // Force Obsidian to evaluate onTrigger() immediately
-        (this as any).trigger(view.editor, activeFile, true);
+        this.trigger(view.editor, activeFile, true);
     }
 
     onTrigger(
@@ -111,10 +112,8 @@ export class CitationSuggest extends EditorSuggest<SuggestionItem> {
         };
     }
 
-    async getSuggestions(
-        context: EditorSuggestContext,
-    ): Promise<SuggestionItem[]> {
-        return this.suggest.getSuggestions(context.query, 20);
+    getSuggestions(context: EditorSuggestContext): Promise<SuggestionItem[]> {
+        return this.latest.run(this.suggest.getSuggestions(context.query, 20));
     }
 
     renderSuggestion(item: SuggestionItem, el: HTMLElement): void {
@@ -126,7 +125,6 @@ export class CitationSuggest extends EditorSuggest<SuggestionItem> {
         evt: MouseEvent | KeyboardEvent,
     ): void {
         if (!this.context) return;
-        if ("isHeader" in suggestion) return;
         if ("isEmpty" in suggestion) return;
 
         let format: CitationFormat = services.settings.defaultCitationFormat;
@@ -154,11 +152,10 @@ export class CitationSuggest extends EditorSuggest<SuggestionItem> {
     // --- Helpers ---
 
     private pickWithFormat(evt: KeyboardEvent, format: CitationFormat): void {
-        // @ts-expect-error
-        // Undocumented: PopoverSuggest.suggestions holds the Suggest instance with selectedItem
         const suggestions = this.suggestions;
         const selectedIndex: number | undefined = suggestions?.selectedItem;
-        const values: SuggestionItem[] | undefined = suggestions?.values;
+        const values = suggestions?.values as unknown as
+            SuggestionItem[] | undefined;
 
         if (
             selectedIndex == null ||
@@ -173,7 +170,6 @@ export class CitationSuggest extends EditorSuggest<SuggestionItem> {
         if (
             !suggestion ||
             !this.context ||
-            "isHeader" in suggestion ||
             "isEmpty" in suggestion
         ) {
             return;

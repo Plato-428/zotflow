@@ -1,8 +1,8 @@
-import { App, SuggestModal } from "obsidian";
+import { App, renderResults, SuggestModal } from "obsidian";
 import { workerBridge } from "bridge";
 import type { AnyIDBZoteroItem, IDBZoteroItem } from "types/db-schema";
 import type { AttachmentData } from "types/zotero-item";
-import { openAttachment } from "utils/viewer";
+import { openAttachment, openItemNote } from "utils/viewer";
 import type { ZotFlowSettings } from "settings/types";
 import { services } from "services/services";
 import { AttachmentSelectModal } from "./attachment-suggest";
@@ -14,6 +14,10 @@ import type {
     SuggestionItem,
     SuggestionItemFilter,
 } from "./zotero-item-suggest";
+import { fireAndForgetIn } from "utils/fire-and-forget";
+import { LatestOnly } from "utils/latest-only";
+
+const ff = fireAndForgetIn("SuggestModalBase");
 
 /**
  * Abstract base class for Zotero item search modals.
@@ -22,6 +26,7 @@ import type {
  */
 export abstract class BaseItemSearchModal extends SuggestModal<SuggestionItem> {
     protected readonly suggest: ZoteroItemSuggest;
+    private readonly latest = new LatestOnly();
 
     constructor(
         app: App,
@@ -47,7 +52,11 @@ export abstract class BaseItemSearchModal extends SuggestModal<SuggestionItem> {
         evt: MouseEvent | KeyboardEvent,
     ): void;
 
-    async getSuggestions(query: string): Promise<SuggestionItem[]> {
+    getSuggestions(query: string): Promise<SuggestionItem[]> {
+        return this.latest.run(this.lookup(query));
+    }
+
+    private async lookup(query: string): Promise<SuggestionItem[]> {
         // When the active token is `field:partial`, show value completions.
         const analysis = analyzeInput(query);
         if (analysis.mode === "value") {
@@ -56,16 +65,16 @@ export abstract class BaseItemSearchModal extends SuggestModal<SuggestionItem> {
                 analysis.partial,
             );
             if (values.length > 0) {
-                return [
-                    { isHeader: true, label: analysis.field },
-                    ...values.map(
-                        (v): SuggestionItem => ({
-                            isValueCompletion: true,
-                            field: analysis.field,
-                            value: v,
-                        }),
-                    ),
-                ];
+                const completions = values.map(
+                    (suggestion): SuggestionItem => ({
+                        isValueCompletion: true,
+                        field: analysis.field,
+                        value: suggestion.value,
+                        match: suggestion.match,
+                    }),
+                );
+                this.suggest.setGroupLabel(completions[0]!, analysis.field);
+                return completions;
             }
         }
         return this.suggest.getSuggestions(query, 50);
@@ -73,23 +82,27 @@ export abstract class BaseItemSearchModal extends SuggestModal<SuggestionItem> {
 
     renderSuggestion(item: SuggestionItem, el: HTMLElement) {
         if ("isValueCompletion" in item) {
+            this.suggest.renderGroupLabel(item, el);
             el.addClass("zotflow-search-value");
-            el.setText(item.value);
+            if (item.match) {
+                renderResults(el, item.value, item.match);
+            } else {
+                el.setText(item.value);
+            }
             return;
         }
         this.suggest.renderSuggestion(item, el, this.inputEl.value);
     }
 
-    async onChooseSuggestion(
+    onChooseSuggestion(
         item: SuggestionItem,
         evt: MouseEvent | KeyboardEvent,
-    ) {}
+    ): void {}
 
     selectSuggestion(
         item: SuggestionItem,
         evt: MouseEvent | KeyboardEvent,
     ): void {
-        if ("isHeader" in item) return;
         if ("isEmpty" in item) return;
 
         // Value-completion rows rewrite the input and re-query in place.
@@ -104,7 +117,7 @@ export abstract class BaseItemSearchModal extends SuggestModal<SuggestionItem> {
             return;
         }
 
-        const zItem = item as AnyIDBZoteroItem;
+        const zItem = item;
         this.handleItemSelected(zItem, evt);
     }
 }
@@ -125,7 +138,7 @@ export class ZoteroSearchModal extends BaseItemSearchModal {
         item: AnyIDBZoteroItem,
         evt: MouseEvent | KeyboardEvent,
     ): void {
-        this.handleSelection(item, evt);
+        ff(this.handleSelection(item, evt), "Failed to open the selection");
     }
 
     private async handleSelection(
@@ -133,7 +146,20 @@ export class ZoteroSearchModal extends BaseItemSearchModal {
         evt: MouseEvent | KeyboardEvent,
     ) {
         if (item.itemType === "attachment") {
-            openAttachment(item.libraryID, item.key, this.app);
+            ff(
+                openAttachment(item.libraryID, item.key, this.app),
+                "Failed to open the attachment",
+            );
+            this.close();
+            return;
+        }
+
+        // A note has no attachments to open: open the note itself.
+        if (item.itemType === "note") {
+            ff(
+                openItemNote(item.libraryID, item.key, this.app),
+                "Failed to open the note",
+            );
             this.close();
             return;
         }
@@ -149,10 +175,13 @@ export class ZoteroSearchModal extends BaseItemSearchModal {
                 `No attachments found for item: ${item.title}`,
             );
         } else if (attachments.length === 1) {
-            openAttachment(
-                attachments[0]!.libraryID,
-                attachments[0]!.key,
-                this.app,
+            ff(
+                openAttachment(
+                    attachments[0]!.libraryID,
+                    attachments[0]!.key,
+                    this.app,
+                ),
+                "Failed to open the attachment",
             );
             this.close();
         } else {

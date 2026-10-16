@@ -3,9 +3,8 @@ import { db } from "db/db";
 import { getAnnotationJson } from "db/annotation";
 
 import type { IParentProxy } from "bridge/types";
-import type { LibraryNoteService } from "worker/services/library-note";
 import type { AttachmentService } from "worker/services/attachment";
-import type { PDFProcessWorker } from "worker/services/pdf-processor";
+import type { DocumentWorkerService } from "worker/services/document-worker";
 import type { ZotFlowSettings } from "settings/types";
 import type { TaskStatus } from "types/tasks";
 import type { IDBZoteroItem, AnyIDBZoteroItem } from "types/db-schema";
@@ -36,14 +35,14 @@ export interface BatchExtractImagesInput {
  *   1. Find PDF attachments
  *   2. Query image/ink annotations that need rendering
  *   3. Download PDF (via AttachmentService cache)
- *   4. Render annotation images (via PDFProcessWorker)
+ *   4. Render annotation images via Document Worker
  *   5. Save images to vault
  */
 export class BatchExtractImagesTask extends BaseTask {
     constructor(
         parentHost: IParentProxy,
         private attachmentService: AttachmentService,
-        private pdfProcessor: PDFProcessWorker,
+        private documentWorker: DocumentWorkerService,
         private settings: ZotFlowSettings,
         private input: BatchExtractImagesInput,
     ) {
@@ -139,7 +138,7 @@ export class BatchExtractImagesTask extends BaseTask {
         let attachments: IDBZoteroItem<AttachmentData>[];
 
         if (item.itemType === "attachment") {
-            attachments = [item as IDBZoteroItem<AttachmentData>];
+            attachments = [item];
         } else {
             attachments = (await db.items
                 .where({
@@ -159,7 +158,6 @@ export class BatchExtractImagesTask extends BaseTask {
                 attachment,
                 this.settings.zoteroapikey,
                 (a: IDBZoteroItem<AnnotationData>) => {
-                    if (a.syncStatus === "deleted") return false;
                     const isImage =
                         a.raw.data.annotationType === "image" ||
                         a.raw.data.annotationType === "ink";
@@ -178,7 +176,7 @@ export class BatchExtractImagesTask extends BaseTask {
 
             if (fileBlob) {
                 const buffer = await fileBlob.arrayBuffer();
-                await this.pdfProcessor.renderAnnotations(
+                await this.documentWorker.renderAnnotations(
                     item.libraryID,
                     buffer,
                     annotations,

@@ -14,6 +14,8 @@ export interface CreateReaderOptions {
     platform?: string;
 
     password?: string;
+    /** Digest of these exact opened bytes, when already computed during download. */
+    contentMD5?: string;
     preview?: boolean;
     colorScheme?: ColorScheme;
     customThemes?: CustomReaderTheme[];
@@ -70,18 +72,42 @@ export type ChildEvents =
     | { type: "setLightTheme"; theme: unknown }
     | { type: "setDarkTheme"; theme: unknown };
 
+/**
+ * A place in the document, in both directions: the reader hands one out for
+ * the current selection, and the parent hands one back to move the reader.
+ *
+ * Only the fields ZotFlow itself reads or writes are named. The rest of the
+ * object is Zotero's, and it also arrives verbatim from the `navigation`
+ * parameter of a `zotflow://open-attachment` link, so the shape is open.
+ */
+export interface ReaderNavigation {
+    annotationID?: string;
+    pageLabel?: string;
+    position?: ZoteroPosition;
+    [key: string]: unknown;
+}
+
 /** Penpal API exposed by the parent (Obsidian) to the reader iframe. */
 export type ParentAPI = {
+    /** Direct iframe bridge: callbacks stay in-process; only Worker RPC uses Comlink. */
+    getSDTPack: (options: {
+        password?: string;
+        onProgress?: (progress: number) => void;
+    }) => Promise<ReaderSDTPackResult>;
     getBlobUrlMap: () => Record<string, string>;
     handleEvent: (evt: ChildEvents) => void;
     isAndroidApp: () => boolean;
     isLocalReader: () => boolean;
     getOrigin: () => string;
-    getMathJaxConfig: () => any;
+    /** Obsidian's own MathJax configuration, handed to the reader verbatim. */
+    getMathJaxConfig: () => Record<string, unknown>;
     getStyleSheets: () => StyleSheetList;
     getColorScheme: () => ColorScheme;
     getPluginSettings: () => ZotFlowSettings;
-    getLinkToSelection: (text: string, navigationInfo: any) => string;
+    getLinkToSelection: (
+        text: string,
+        navigationInfo: ReaderNavigation,
+    ) => string;
     handleSetDataTransferAnnotations: (
         dataTransfer: DataTransfer,
         annotations: AnnotationJSON[],
@@ -101,13 +127,23 @@ export type ParentAPI = {
     ) => { unload: () => void };
 };
 
+/** The upstream Reader owns successful SDT results for the lifetime of its document. */
+export type ReaderSDTPackResult =
+    | {
+          ok: true;
+          bytes: ArrayBuffer;
+          packVersion: number;
+          schemaMajorVersion: number;
+      }
+    | { ok: false; reason: "unavailable" | "failed" };
+
 /** Penpal API exposed by the reader iframe to the parent — init, navigate, annotate, destroy. */
 export type ChildAPI = {
     initReader: (opts: CreateReaderOptions) => Promise<boolean>;
     setColorScheme: (colorScheme: ColorScheme) => Promise<boolean>;
     addAnnotation: (annotation: AnnotationJSON) => Promise<boolean>;
     refreshAnnotations: (annotations: AnnotationJSON[]) => Promise<boolean>;
-    navigate: (navigationInfo: any) => Promise<boolean>;
+    navigate: (navigationInfo: ReaderNavigation) => Promise<boolean>;
     destroy: () => Promise<boolean>;
 };
 
@@ -130,9 +166,16 @@ export type AnnotationType =
 /** Serialized annotation object exchanged between the reader iframe and the plugin. */
 export interface AnnotationJSON {
     libraryID?: number;
+    /**
+     * Attachment item key this annotation belongs to (ZotFlow addition, like
+     * libraryID). The reader strips it in transit, so payload builders restore
+     * it from the attachment they were opened on.
+     */
+    parentItem?: string;
     id: string;
     type: AnnotationType;
-    image?: Uint8Array;
+    /** A `data:image/png;base64,...` URI, split and decoded by saveBase64Image. */
+    image?: string;
     isExternal?: boolean;
     authorName?: string;
     isAuthorNameAuthoritative?: boolean;

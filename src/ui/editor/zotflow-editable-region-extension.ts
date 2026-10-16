@@ -5,193 +5,23 @@ import {
     type EditorState,
     type Text,
 } from "@codemirror/state";
-import { ViewPlugin, type ViewUpdate } from "@codemirror/view";
-import { editorInfoField } from "obsidian";
+import { ViewPlugin, type EditorView, type ViewUpdate } from "@codemirror/view";
+import { TFile, editorInfoField } from "obsidian";
 import { workerBridge } from "bridge";
+import { services } from "services/services";
+import { LocalDataManager } from "ui/reader/local-data-manager";
+import { registerNoteTextSource } from "ui/modals/note-gone-modal";
 import { parseTagsLine, zoteroTagToObsidianTag } from "utils/special-tags";
+import {
+    parseEditableRegions,
+    type EditableRegion,
+} from "./editable-region-parser";
 
 /* ================================================================ */
-/*  Marker Registry                                                 */
+/*  Parser (extracted to editable-region-parser.ts — pure, testable) */
 /* ================================================================ */
 
-interface MarkerType {
-    begPrefix: string;
-    endPrefix: string;
-    type: string;
-}
-
-const MARKER_REGISTRY: MarkerType[] = [
-    { begPrefix: "ZF_NOTE_BEG_", endPrefix: "ZF_NOTE_END_", type: "NOTE" },
-    { begPrefix: "ZF_ANNO_BEG_", endPrefix: "ZF_ANNO_END_", type: "ANNO" },
-    {
-        begPrefix: "ZF_ABSTRACT_BEG_",
-        endPrefix: "ZF_ABSTRACT_END_",
-        type: "ABSTRACT",
-    },
-    { begPrefix: "ZF_TAGS_BEG_", endPrefix: "ZF_TAGS_END_", type: "TAGS" },
-];
-
-/* ================================================================ */
-/*  EditableRegion                                                  */
-/* ================================================================ */
-
-export interface EditableRegion {
-    /** Marker category — e.g. "NOTE", future "ANNO". */
-    type: string;
-    /** Zotero item key extracted from marker (e.g. the note key). */
-    key: string;
-    /** Editable content start (first char after BEG marker line). */
-    from: number;
-    /** Editable content end (last char before END marker line). */
-    to: number;
-    /** BEG marker line start offset. */
-    begFrom: number;
-    /** BEG marker line end offset. */
-    begTo: number;
-    /** END marker line start offset. */
-    endFrom: number;
-    /** END marker line end offset. */
-    endTo: number;
-    /** `<!-- ZF_NOTE_META ... -->` start offset (if present inside region). */
-    metaFrom?: number;
-    /** `<!-- ZF_NOTE_META ... -->` end offset (if present inside region). */
-    metaTo?: number;
-}
-
-/* ================================================================ */
-/*  Parser                                                          */
-/* ================================================================ */
-
-/** Build a single regex that matches all registered BEG/END markers. */
-function buildMarkerRegex(): RegExp {
-    const prefixes: string[] = [];
-    for (const m of MARKER_REGISTRY) {
-        prefixes.push(m.begPrefix, m.endPrefix);
-    }
-    // Escape regex-special chars in prefixes (defensive)
-    const escaped = prefixes.map((p) =>
-        p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-    );
-    // Match: <!-- <PREFIX><KEY> -->
-    return new RegExp(`<!-- (${escaped.join("|")})(\\w+) -->`, "g");
-}
-
-const MARKER_REGEX = buildMarkerRegex();
-
-interface ParsedMarker {
-    type: string;
-    role: "beg" | "end";
-    key: string;
-    lineFrom: number;
-    lineTo: number;
-}
-
-/** Single-pass parse of all editable regions in the document. */
-export function parseEditableRegions(doc: Text): EditableRegion[] {
-    const text = doc.toString();
-    MARKER_REGEX.lastIndex = 0;
-
-    const markers: ParsedMarker[] = [];
-
-    let match;
-    while ((match = MARKER_REGEX.exec(text))) {
-        const prefix = match[1]!;
-        const key = match[2]!;
-
-        // Find which registry entry this prefix belongs to
-        let markerType: MarkerType | undefined;
-        let role: "beg" | "end" | undefined;
-        for (const m of MARKER_REGISTRY) {
-            if (prefix === m.begPrefix) {
-                markerType = m;
-                role = "beg";
-                break;
-            }
-            if (prefix === m.endPrefix) {
-                markerType = m;
-                role = "end";
-                break;
-            }
-        }
-        if (!markerType || !role) continue;
-
-        const line = doc.lineAt(match.index);
-        markers.push({
-            type: markerType.type,
-            role,
-            key,
-            lineFrom: line.from,
-            lineTo: line.to,
-        });
-    }
-
-    // Pair BEG with the nearest following END of the same type+key
-    const regions: EditableRegion[] = [];
-    const used = new Set<number>();
-
-    for (let i = 0; i < markers.length; i++) {
-        const beg = markers[i]!;
-        if (beg.role !== "beg" || used.has(i)) continue;
-
-        for (let j = i + 1; j < markers.length; j++) {
-            const end = markers[j]!;
-            if (used.has(j)) continue;
-            if (
-                end.role !== "end" ||
-                end.type !== beg.type ||
-                end.key !== beg.key
-            )
-                continue;
-
-            // Editable content starts after the BEG line's newline
-            const editFrom = beg.lineTo + 1;
-            // Editable content ends at the char before the END line
-            const editTo = end.lineFrom > 0 ? end.lineFrom - 1 : end.lineFrom;
-
-            // Only create region if there's a valid range
-            if (editFrom <= editTo) {
-                regions.push({
-                    type: beg.type,
-                    key: beg.key,
-                    from: editFrom,
-                    to: editTo,
-                    begFrom: beg.lineFrom,
-                    begTo: beg.lineTo,
-                    endFrom: end.lineFrom,
-                    endTo: end.lineTo,
-                });
-            }
-
-            used.add(i);
-            used.add(j);
-            break;
-        }
-    }
-
-    // Detect <!-- ZF_NOTE_META ... --> inside NOTE regions only.
-    // Uses the global flag + lastIndex to scan within each region's bounds
-    // on the already-allocated `text` string — avoids a .slice() per region.
-    const META_REGEX_G = /<!-- ZF_NOTE_META [\s\S]*?-->/g;
-    for (const region of regions) {
-        if (region.type !== "NOTE") continue;
-
-        META_REGEX_G.lastIndex = region.from;
-        const metaMatch = META_REGEX_G.exec(text);
-        if (metaMatch && metaMatch.index < region.to) {
-            region.metaFrom = metaMatch.index;
-            region.metaTo = metaMatch.index + metaMatch[0]!.length;
-
-            // Move editable start past the meta line
-            const metaLine = doc.lineAt(region.metaTo);
-            const newFrom = metaLine.to + 1;
-            if (newFrom <= region.to) {
-                region.from = newFrom;
-            }
-        }
-    }
-
-    return regions;
-}
+export { parseEditableRegions, type EditableRegion };
 
 /* ================================================================ */
 /*  StateField                                                      */
@@ -284,15 +114,98 @@ function getLibraryId(doc: Text): number | null {
     return match?.[1] ? Number(match[1]) : null;
 }
 
+/**
+ * The source note's item (`zotero-key` in frontmatter): the parent of the
+ * child notes shown in it.
+ */
+function getZoteroKey(doc: Text): string | null {
+    if (doc.sliceString(0, 3) !== "---") return null;
+
+    const head = doc.sliceString(0, 10000);
+    const fmMatch = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/.exec(
+        head,
+    );
+    if (!fmMatch) return null;
+
+    const match = /^zotero-key:\s*["']?([A-Za-z0-9]+)["']?\s*$/m.exec(
+        fmMatch[0],
+    );
+    return match?.[1] ?? null;
+}
+
+/** Extract the local attachment path from `zotflow-local-attachment: "[[path]]"`. */
+export function getLocalAttachmentPath(doc: Text): string | null {
+    if (doc.sliceString(0, 3) !== "---") return null;
+
+    const head = doc.sliceString(0, 10000);
+    const fmMatch = /^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/.exec(
+        head,
+    );
+    if (!fmMatch) return null;
+
+    const match =
+        /^zotflow-local-attachment:\s*["']?\[\[(.+?)\]\]["']?\s*$/m.exec(
+            fmMatch[0],
+        );
+
+    return match?.[1] ?? null;
+}
+
+/** Where region edits should be saved: a Zotero library or a local sidecar. */
+type SyncTarget =
+    | { kind: "zotero"; libraryId: number }
+    | { kind: "local"; attachmentPath: string };
+
 /* ================================================================ */
 /*  ViewPlugin — sync edits to Worker                               */
 /* ================================================================ */
 
-const DEBOUNCE_DELAY = 2000;
+/** Pause before an annotation comment of a local file is written to its sidecar. */
+const LOCAL_DEBOUNCE_DELAY = 2000;
 
+/** The text of NOTE region `key` as sent to the worker (meta comment included), or null. */
+export function noteRegionText(state: EditorState, key: string): string | null {
+    const region = (state.field(editableRegionsField, false) ?? []).find(
+        (r) => r.type === "NOTE" && r.key === key,
+    );
+    if (!region) return null;
+    return state.doc.sliceString(region.metaFrom ?? region.from, region.to);
+}
+
+/** A local annotation comment waiting out the debounce. */
+interface PendingWrite {
+    timer: number;
+    /** Writes the comment; resolves once it is in the sidecar. */
+    run: () => Promise<void>;
+}
+
+/**
+ * Sends region edits as the user types. Zotero notes and annotation
+ * comments go straight to the worker's edit queue, which debounces and
+ * writes them (and writes them first when the source note re-renders or a
+ * sync starts). Comments on local files are written to their sidecar here,
+ * after a pause.
+ */
 const editableRegionSyncPlugin = ViewPlugin.fromClass(
     class {
-        private debouncers = new Map<string, ReturnType<typeof setTimeout>>();
+        private pending = new Map<string, PendingWrite>();
+        private destroyed = false;
+        private unregister: (() => void)[];
+
+        constructor(private readonly view: EditorView) {
+            this.unregister = [
+                // A sync first writes the sidecar comments still held back.
+                services.pendingEdits.register(() => this.flush()),
+                // A gone note's prompt reads its latest text from here.
+                registerNoteTextSource({
+                    text: (libraryID, noteKey) =>
+                        this.destroyed ||
+                        getLibraryId(this.view.state.doc) !== libraryID
+                            ? null
+                            : noteRegionText(this.view.state, noteKey),
+                }),
+            ];
+        }
 
         update(update: ViewUpdate) {
             if (!update.docChanged) return;
@@ -312,168 +225,237 @@ const editableRegionSyncPlugin = ViewPlugin.fromClass(
             );
             if (!isUserEdit) return;
 
-            const libraryId = getLibraryId(update.state.doc);
-            if (libraryId === null) return;
-
             const regions = update.state.field(editableRegionsField, false);
             if (!regions || regions.length === 0) return;
 
+            const libraryId = getLibraryId(update.state.doc);
+            let target: SyncTarget | null = null;
+            if (libraryId !== null) {
+                target = { kind: "zotero", libraryId };
+            } else {
+                const attachmentPath = getLocalAttachmentPath(update.state.doc);
+                if (attachmentPath !== null) {
+                    target = { kind: "local", attachmentPath };
+                }
+            }
+            if (!target) return;
+
             // Find which regions were touched by the changes
+            const touched = new Set<EditableRegion>();
             update.changes.iterChangedRanges((fromA, toA) => {
                 for (const region of regions) {
                     // Check if the change range overlaps this region's editable zone
                     if (fromA <= region.to && toA >= region.from) {
-                        this.scheduleSync(libraryId, region, update.state);
+                        touched.add(region);
                     }
                 }
             });
+            for (const region of touched) {
+                this.send(target, region, update.state);
+            }
         }
 
-        private scheduleSync(
-            libraryId: number,
+        /** Writes the sidecar comments still held back. */
+        flush(): Promise<void> {
+            const runs = [...this.pending.values()];
+            this.pending.clear();
+            for (const p of runs) window.clearTimeout(p.timer);
+            return Promise.all(runs.map((p) => p.run())).then(() => undefined);
+        }
+
+        private send(
+            target: SyncTarget,
             region: EditableRegion,
             state: EditorState,
         ) {
-            const debounceKey = `${libraryId}-${region.type}-${region.key}`;
+            // PERSIST regions are purely local — never sync them anywhere.
+            if (region.type === "PERSIST") return;
 
-            // Clear previous timer for this region
-            const existing = this.debouncers.get(debounceKey);
-            if (existing !== undefined) {
-                clearTimeout(existing);
-            }
-
-            const timer = setTimeout(() => {
-                this.debouncers.delete(debounceKey);
-
+            if (target.kind === "zotero") {
+                // The source note's item: the parent of its child notes, and
+                // the note whose render must first write these edits.
+                const sourceKey = getZoteroKey(state.doc) ?? "";
                 if (region.type === "NOTE") {
                     // NOTE regions: include meta comment for wrapper-div
                     // attributes reconstruction, then convert MD → HTML.
-                    const syncFrom = region.metaFrom ?? region.from;
-                    const noteContent = state.doc.sliceString(
-                        syncFrom,
+                    const content = state.doc.sliceString(
+                        region.metaFrom ?? region.from,
                         region.to,
                     );
-                    workerBridge.itemNote
-                        .updateNoteContent(
-                            libraryId,
+                    workerBridge.editQueue
+                        .submitNote(
+                            target.libraryId,
                             region.key,
-                            noteContent,
+                            content,
                             "editor",
+                            sourceKey,
+                            sourceKey,
                         )
-                        .catch(() => {
-                            // Background sync — errors logged by worker
-                        });
+                        .catch((e: unknown) => this.reportSendFailure(e));
                 } else if (region.type === "ANNO") {
-                    // ANNO regions live inside blockquotes in the template:
-                    //   > <!-- ZF_ANNO_BEG_KEY -->
-                    //   > comment text here
-                    //   > <!-- ZF_ANNO_END_KEY -->
-                    // Strip the leading `> ` prefix from each line before
-                    // converting MD → restricted HTML for the annotation comment.
+                    // MD → restricted HTML happens worker-side.
+                    workerBridge.editQueue
+                        .submitAnnotationComment(
+                            target.libraryId,
+                            region.key,
+                            annoCommentText(state, region),
+                            sourceKey,
+                        )
+                        .catch((e: unknown) => this.reportSendFailure(e));
+                } else if (region.type === "ABSTRACT") {
                     const content = state.doc.sliceString(
                         region.from,
                         region.to,
                     );
                     const stripped = content.replace(/^>[ \t]?/gm, "");
-                    workerBridge.annotation
-                        .updateAnnotationComment(
-                            libraryId,
+                    workerBridge.editQueue
+                        .submitAbstract(
+                            target.libraryId,
                             region.key,
                             stripped,
+                            sourceKey,
                         )
-                        .catch(() => {
-                            // Background sync — errors logged by worker
-                        });
-                } else if (region.type === "ABSTRACT") {
-                    // ABSTRACT regions are rendered in blockquote format.
-                    // Strip the leading `> ` prefix before persisting.
-                    const content = state.doc.sliceString(
-                        region.from,
-                        region.to,
-                    );
-                    const stripped = content.replace(/^>[ \t]?/gm, "");
-                    workerBridge.itemNote
-                        .updateItemAbstract(libraryId, region.key, stripped)
-                        .catch(() => {
-                            // Background sync — errors logged by worker
-                        });
+                        .catch((e: unknown) => this.reportSendFailure(e));
 
-                    // Live-patch the YAML frontmatter's `abstract` field (if
-                    // present in the user's template) so it doesn't show a
-                    // stale value until the next full note re-render, which
-                    // only happens after the edit round-trips through sync.
                     const fileInfo = state.field(editorInfoField, false);
                     const file = fileInfo?.file;
                     if (file) {
                         fileInfo.app.fileManager
-                            .processFrontMatter(file, (fm) => {
-                                if (
-                                    Object.prototype.hasOwnProperty.call(
-                                        fm,
-                                        "abstract",
-                                    )
-                                ) {
-                                    fm.abstract = stripped;
-                                }
-                            })
-                            .catch(() => {
-                                // Best-effort — ignore concurrent-write failures
-                            });
+                            .processFrontMatter(
+                                file,
+                                (fm: Record<string, unknown>) => {
+                                    if (
+                                        Object.prototype.hasOwnProperty.call(
+                                            fm,
+                                            "abstract",
+                                        )
+                                    ) {
+                                        fm.abstract = stripped;
+                                    }
+                                },
+                            )
+                            .catch(() => {});
                     }
                 } else if (region.type === "TAGS") {
-                    // TAGS region holds a comma-separated `#Tag_Name` list
-                    // (see the template's "Tags:" line). Parse back to raw
-                    // Zotero tag names and push.
                     const content = state.doc.sliceString(
                         region.from,
                         region.to,
                     );
-                    const tagNames = parseTagsLine(content);
-                    workerBridge.itemNote
-                        .updateItemTags(libraryId, region.key, tagNames)
-                        .catch(() => {
-                            // Background sync — errors logged by worker
-                        });
+                    const tags = parseTagsLine(content);
+                    workerBridge.editQueue
+                        .submitTags(
+                            target.libraryId,
+                            region.key,
+                            tags,
+                            sourceKey,
+                        )
+                        .catch((e: unknown) => this.reportSendFailure(e));
 
-                    // Live-patch the YAML frontmatter's `tags` array (if
-                    // present) so it doesn't show a stale value until the
-                    // next full note re-render. Rendered in the same
-                    // `#Tag_Name` form the template uses so Obsidian still
-                    // recognizes them as tags.
                     const fileInfo = state.field(editorInfoField, false);
                     const file = fileInfo?.file;
                     if (file) {
                         fileInfo.app.fileManager
-                            .processFrontMatter(file, (fm) => {
-                                if (
-                                    Object.prototype.hasOwnProperty.call(
-                                        fm,
-                                        "tags",
-                                    )
-                                ) {
-                                    fm.tags = tagNames.map((t) =>
-                                        zoteroTagToObsidianTag(t),
-                                    );
-                                }
-                            })
-                            .catch(() => {
-                                // Best-effort — ignore concurrent-write failures
-                            });
+                            .processFrontMatter(
+                                file,
+                                (fm: Record<string, unknown>) => {
+                                    if (
+                                        Object.prototype.hasOwnProperty.call(
+                                            fm,
+                                            "tags",
+                                        )
+                                    ) {
+                                        fm.tags = tags.map((t) => zoteroTagToObsidianTag(t));
+                                    }
+                                },
+                            )
+                            .catch(() => {});
                     }
                 }
-            }, DEBOUNCE_DELAY);
+                return;
+            }
 
-            this.debouncers.set(debounceKey, timer);
+            // Local notes only carry ANNO regions.
+            if (region.type !== "ANNO") return;
+            const debounceKey = `${target.attachmentPath}-${region.key}`;
+            const existing = this.pending.get(debounceKey);
+            if (existing !== undefined) window.clearTimeout(existing.timer);
+
+            const run = () =>
+                this.writeLocalComment(
+                    target.attachmentPath,
+                    region.key,
+                    annoCommentText(state, region),
+                );
+            const timer = window.setTimeout(() => {
+                this.pending.delete(debounceKey);
+                void run();
+            }, LOCAL_DEBOUNCE_DELAY);
+            this.pending.set(debounceKey, { timer, run });
+        }
+
+        private reportSendFailure(e: unknown) {
+            services.logService.error(
+                "Failed to send an edit to the worker",
+                "ZotFlowEditableRegion",
+                e,
+            );
+        }
+
+        /**
+         * Local attachment: comments live in the .zf.json sidecar as Zotero's
+         * restricted annotation HTML — LocalDataManager converts MD → HTML,
+         * mirroring the worker path. No note re-render (the note already
+         * contains the new text). Never rejects.
+         */
+        private async writeLocalComment(
+            attachmentPath: string,
+            annotationKey: string,
+            comment: string,
+        ): Promise<void> {
+            const file = services.app.vault.getAbstractFileByPath(attachmentPath);
+            if (!(file instanceof TFile)) return;
+            try {
+                const changed = await new LocalDataManager(
+                    file,
+                ).updateAnnotationCommentFromNote(annotationKey, comment);
+                if (changed) {
+                    // Let an open local reader refresh its cache.
+                    services.eventHub.localAnnotationChanged.emit(
+                        attachmentPath,
+                        annotationKey,
+                    );
+                }
+            } catch (e) {
+                services.logService.error(
+                    "Failed to save local annotation comment from note",
+                    "ZotFlowEditableRegion",
+                    e,
+                );
+            }
         }
 
         destroy() {
-            for (const timer of this.debouncers.values()) {
-                clearTimeout(timer);
-            }
-            this.debouncers.clear();
+            // Closing the editor writes what it still holds back.
+            void this.flush();
+            this.destroyed = true;
+            for (const unregister of this.unregister) unregister();
         }
     },
 );
+
+/**
+ * An ANNO region's comment. ANNO regions live inside blockquotes in the
+ * template:
+ *   > <!-- ZF_ANNO_BEG_KEY -->
+ *   > comment text here
+ *   > <!-- ZF_ANNO_END_KEY -->
+ * so the leading `> ` of each line is stripped.
+ */
+function annoCommentText(state: EditorState, region: EditableRegion): string {
+    return state.doc
+        .sliceString(region.from, region.to)
+        .replace(/^>[ \t]?/gm, "");
+}
 
 /* ================================================================ */
 /*  Region Unlock Toggle                                            */

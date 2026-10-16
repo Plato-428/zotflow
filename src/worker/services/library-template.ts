@@ -9,11 +9,7 @@ import type {
     RelatedItemTemplateContext,
 } from "types/template-context";
 import type { IParentProxy } from "bridge/types";
-import type {
-    AnnotationData,
-    AttachmentData,
-    NoteData,
-} from "types/zotero-item";
+import type { AttachmentData, NoteData } from "types/zotero-item";
 import type { ZotFlowSettings } from "settings/types";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
 import {
@@ -22,15 +18,48 @@ import {
     zoteroSelectItemUri,
 } from "utils/zotero-uri";
 import { getAnnotationJson } from "db/annotation";
+import { itemTreeFingerprint } from "db/sync/commit";
 import type { AnnotationJSON } from "types/zotero-reader";
+import { zoteroToZotflowLinks } from "worker/convert/note-links";
+import { createDbNoteLinkResolver } from "./note-link-resolver";
 import type { DbHelperService } from "./db-helper";
 import type { ConvertService } from "./convert";
 import type { Html2MdOptions } from "worker/convert";
 import type { NotePathService } from "./note-path";
 import type { CitationTemplateInput } from "services/citation-service";
-import { extractYear } from "utils/date";
+import type { CslRenderWorkerService } from "./csl-render";
+import type { ZoteroAPIService } from "./zotero";
+import type {
+    CiteProps,
+    CSLItem,
+    OutputFormat,
+    RenderOptions,
+} from "worker/csl";
+import { buildItemMetadata } from "utils/zotero-fields";
 import { splitSpecialTags } from "utils/special-tags";
-import { metaHtml2md } from "worker/convert/annotation-comment";
+import { metaHtml2md, stripMarkdown } from "worker/convert/annotation-comment";
+import { listToTabs } from "worker/convert/list-tabs";
+import {
+    mandatoryKeyHint,
+    previewResult,
+    renderFragment,
+    renderLiquid,
+    renderTemplateFrontmatter,
+    splitFrontmatter,
+    strictFilterEngine,
+    trimmedStart,
+    zfEnv,
+    type LiquidFilterScope,
+} from "./liquid-support";
+import { describeTemplateScope } from "./template-variables";
+import type {
+    TemplatePreviewResult,
+    TemplateVariables,
+} from "types/template-preview";
+import {
+    mergeTemplateFrontmatter,
+    withMandatoryFirst,
+} from "utils/template-frontmatter";
 
 const DEFAULT_ITEM_TEMPLATE = `---
 citationKey: {{ item.citationKey | json }}
@@ -42,7 +71,7 @@ date: {{ item.date | json }}
 year: {{ item.year }}
 url: {{ item.url | json }}
 doi: {{ item.DOI | json }}
-tags: [{% for t in item.tags %}"#{{ t.tag | replace: " ", "\_" }}"{% unless forloop.last %}, {% endunless %}{% endfor %}]
+tags: [{% for t in item.tags %}"#{{ t.tag | replace: " ", "_" }}"{% unless forloop.last %}, {% endunless %}{% endfor %}]
 {%- if item.readStatus %}
 read-status: "{{ item.readStatus }}"
 {%- endif %}
@@ -86,7 +115,7 @@ rating: "{{ item.rating }}"
 {%- endif -%}
 >
 > {{ annotation.comment | wrap_editable: "ANNO", annotation.key | replace: newline, quote_string }}
-> {% if annotation.tags and annotation.tags.length > 0 -%} {% for t in annotation.tags %}#{{ t.tag | replace: " ", "\_" }}{% unless forloop.last %} {% endunless %}{% endfor %} {%- endif %}
+> {% if annotation.tags and annotation.tags.length > 0 -%} {% for t in annotation.tags %}#{{ t.tag | replace: " ", "_" }}{% unless forloop.last %} {% endunless %}{% endfor %} {%- endif %}
 ^{{ annotation.key }}
 
 {%- endfor -%}
@@ -104,7 +133,7 @@ rating: "{{ item.rating }}"
 {%- endif -%}
 >
 > {{ annotation.comment | wrap_editable: "ANNO", annotation.key | replace: newline, quote_string }}
-> {% if annotation.tags and annotation.tags.length > 0 -%} {% for t in annotation.tags %}#{{ t.tag | replace: " ", "\_" }}{% unless forloop.last %} {% endunless %}{% endfor %} {%- endif %}
+> {% if annotation.tags and annotation.tags.length > 0 -%} {% for t in annotation.tags %}#{{ t.tag | replace: " ", "_" }}{% unless forloop.last %} {% endunless %}{% endfor %} {%- endif %}
 ^{{ annotation.key }}
 
 {%- endfor -%}
@@ -126,13 +155,73 @@ const FALLBACK_FOOTNOTE_TEMPLATE = `[^{{ item.citationKey | default: item.key }}
  {{ item.creators[0].name }} {%- else -%}
 Unknown Author {%- endif -%}, *{{ item.title }}* ({{ item.year }}).`;
 
+/** The citation formats, each with its own template setting. */
+export type CitationTemplateFormat = "pandoc" | "wikilink" | "footnote" | "footnote-ref";
+
+/** Built-in templates, used while a citation template setting is empty. */
+const FALLBACK_CITATION_TEMPLATES: Record<CitationTemplateFormat, string> = {
+    pandoc: FALLBACK_PANDOC_TEMPLATE,
+    wikilink: FALLBACK_WIKILINK_TEMPLATE,
+    "footnote-ref": FALLBACK_FOOTNOTE_REF_TEMPLATE,
+    footnote: FALLBACK_FOOTNOTE_TEMPLATE,
+};
+
+/** The setting that holds each format's template. */
+const CITATION_TEMPLATE_SETTINGS = {
+    pandoc: "citationPandocTemplate",
+    wikilink: "citationWikilinkTemplate",
+    "footnote-ref": "citationFootnoteRefTemplate",
+    footnote: "citationFootnoteTemplate",
+} as const satisfies Record<CitationTemplateFormat, keyof ZotFlowSettings>;
+
 // Matches http(s)://zotero.org/{users|groups}/<id>/items/<KEY>
 const ZOTERO_URI_RE =
     /^https?:\/\/zotero\.org\/(?:users|groups)\/(\d+)\/items\/([A-Z0-9]+)$/i;
 
+// Valid `format:` values for the citation/bibliography filters.
+const CSL_OUTPUT_FORMATS = new Set([
+    "text",
+    "html",
+    "markdown",
+    "markdown-pure",
+]);
+
+/** Root scope handed to Liquid when rendering a source note. */
+interface ItemRenderContext {
+    item: ItemTemplateContext;
+    settings: ZotFlowSettings;
+    __zfReadOnlyKeys: Set<string>;
+    __zfZoteroLibPrefix: string;
+}
+
+/** Root scope handed to Liquid when rendering a citation. */
+interface CitationRenderContext {
+    item: ItemTemplateContext;
+    notePath: string;
+    annotations?: AnnotationTemplateContext[];
+}
+
+/** Identity fields the link filters need; every template context supplies them. */
+interface LinkableItem {
+    key: string;
+    libraryID: number;
+    parentItem?: string;
+}
+
 /** LiquidJS template engine for rendering library (Zotero) item source notes. */
+/** Options of the source-note and citation engine. */
+const ENGINE_OPTIONS = {
+    extname: ".md",
+    greedy: false,
+    globals: {
+        newline: "\n",
+    },
+};
+
 export class LibraryTemplateService {
     private engine: Liquid;
+    /** The engine for previews: unknown filters are errors there (`strictFilterEngine`). */
+    private previewEngine: Liquid;
 
     constructor(
         private settings: ZotFlowSettings,
@@ -140,18 +229,19 @@ export class LibraryTemplateService {
         private dbHelper: DbHelperService,
         private notePathService: NotePathService,
         private convertService: ConvertService,
+        private cslRender: CslRenderWorkerService,
+        private zotero: ZoteroAPIService,
     ) {
         this.initialize();
     }
 
+    /** `Liquid.parseAndRender` is typed `any`; every template here is text. */
+    private async render(template: string, scope: object): Promise<string> {
+        return renderLiquid(this.engine, template, scope);
+    }
+
     initialize() {
-        this.engine = new Liquid({
-            extname: ".md",
-            greedy: false,
-            globals: {
-                newline: "\n",
-            },
-        });
+        this.engine = new Liquid(ENGINE_OPTIONS);
         this.engine.registerFilter("process_nav_info", (input: string) => {
             const navInfo = {
                 annotationID: input,
@@ -163,11 +253,15 @@ export class LibraryTemplateService {
         // per call via a filter argument.
         const resolveTarget = (arg: unknown): "zotflow" | "zotero" =>
             String(arg).toLowerCase() === "zotero" ? "zotero" : "zotflow";
-        const getZoteroPrefix = (ctx: any): string =>
-            ctx?.context?.environments?.__zfZoteroLibPrefix || "library";
+        const getZoteroPrefix = (scope: LiquidFilterScope): string =>
+            zfEnv(scope).__zfZoteroLibPrefix || "library";
         this.engine.registerFilter(
             "annotation_link",
-            function (this: any, anno: any, target?: string): string {
+            function (
+                this: LiquidFilterScope,
+                anno: LinkableItem | null | undefined,
+                target?: string,
+            ): string {
                 if (!anno) return "";
                 if (resolveTarget(target) === "zotero") {
                     const prefix = getZoteroPrefix(this);
@@ -182,7 +276,11 @@ export class LibraryTemplateService {
         );
         this.engine.registerFilter(
             "attachment_link",
-            function (this: any, att: any, target?: string): string {
+            function (
+                this: LiquidFilterScope,
+                att: LinkableItem | null | undefined,
+                target?: string,
+            ): string {
                 if (!att) return "";
                 if (resolveTarget(target) === "zotero") {
                     const prefix = getZoteroPrefix(this);
@@ -193,7 +291,11 @@ export class LibraryTemplateService {
         );
         this.engine.registerFilter(
             "item_link",
-            function (this: any, item: any, target?: string): string {
+            function (
+                this: LiquidFilterScope,
+                item: LinkableItem | null | undefined,
+                target?: string,
+            ): string {
                 if (!item) return "";
                 if (resolveTarget(target) === "zotero") {
                     const prefix = getZoteroPrefix(this);
@@ -220,14 +322,37 @@ export class LibraryTemplateService {
              * citation render paths that don't prep one), preserving the old
              * behaviour for callers that don't opt in.
              */
-            function (this: any, input: string, type: string, key: string) {
+            function (
+                this: LiquidFilterScope,
+                input: string,
+                type: string,
+                key: string,
+            ) {
                 if (!type || !key) return input;
-                const readOnlyKeys: Set<string> | undefined =
-                    this?.context?.environments?.__zfReadOnlyKeys;
+                const readOnlyKeys = zfEnv(this).__zfReadOnlyKeys;
                 if (readOnlyKeys && readOnlyKeys.has(`${type}:${key}`)) {
                     return input;
                 }
+                // Always block form: markers on their own lines. An inline
+                // (single-line) layout was tried and retired — a line
+                // starting with `<!--` becomes a CommonMark HTML block, so
+                // markdown inside it renders raw in Reading view; `%%`
+                // markers avoid that but introduce stray blank lines.
                 return `<!-- ZF_${type}_BEG_${key} -->\n${input}\n<!-- ZF_${type}_END_${key} -->`;
+            },
+        );
+        this.engine.registerFilter("strip_markdown", (input: string) => {
+            if (!input) return "";
+            return stripMarkdown(input);
+        });
+        this.engine.registerFilter(
+            "list_tabs",
+            (input: string, indent?: string) => {
+                if (!input) return "";
+                return listToTabs(
+                    input,
+                    typeof indent === "string" ? indent : "\t",
+                );
             },
         );
         this.engine.registerFilter("html2md", async (input: string) => {
@@ -238,104 +363,302 @@ export class LibraryTemplateService {
                     this.settings.annotationImageFolder.replace(/\/$/, "") ||
                     undefined,
                 strictLineBreaks: vaultConfig.strictLineBreaks,
+                // Always on: display-only anchors, unconditionally
+                // stripped on save — no risk for a setting to guard.
+                linkCitationSpans: true,
             };
-            return await this.convertService.html2md(input, opts);
+            let md = await this.convertService.html2md(input, opts);
+            // Display native zotero:// links as ZotFlow links. Runs on the
+            // MARKDOWN side: canonical zotero links carry at most one query
+            // param (no `&`), so they pass the markdown serializer without
+            // escaping, while the multi-param zotflow links we emit here
+            // never go through a serializer again.
+            if (this.settings.convertNoteLinks) {
+                md = await zoteroToZotflowLinks(md, createDbNoteLinkResolver());
+            }
+            return md;
         });
+        // CSL rendering filters. Both take one input or a list; args are an
+        // optional positional style shorthand plus kwargs:
+        //   {{ item | citation: "ieee" }}
+        //   {{ annotation | citation }}   -> cites the annotated item with
+        //                                    the page as locator, e.g. (Doe, 2020, p. 5)
+        //   {{ items | citation }}        -> ONE cluster: (Doe, 2020; Roe, 2021)
+        //   {{ items | bibliography: style: "apa", locale: "de-DE", format: "text" }}
+        // A citation list renders as a single cluster and a bibliography list
+        // as one batch — sorting/numbering/merging are computed by citeproc
+        // over the whole input, so looping in the template would break them.
+        // Defaults: style -> settings.cslDefaultStyleId, locale -> style's
+        // default-locale -> en-US, format -> settings.cslDefaultFormat.
+        // Note: each call is a standalone render, so author disambiguation
+        // does not carry across separate citation calls.
+        this.engine.registerFilter(
+            "citation",
+            async (input: unknown, ...args: unknown[]) => {
+                const { opts } = this.parseCslRenderArgs(args);
+                const refs = Array.isArray(input) ? input : [input];
+                if (refs.length === 0) {
+                    throw new Error(
+                        "The citation filter received an empty item list",
+                    );
+                }
+                const items: CSLItem[] = [];
+                const props: (CiteProps | undefined)[] = [];
+                let hasProps = false;
+                for (let ref of refs) {
+                    let p: CiteProps | undefined;
+                    if (this.isAnnotationContext(ref)) {
+                        const resolved = await this.resolveAnnotationCite(ref);
+                        ref = resolved.ref;
+                        p = resolved.props;
+                    }
+                    items.push(await this.getCslJson(ref, "citation"));
+                    props.push(p);
+                    if (p) hasProps = true;
+                }
+                return this.cslRender.renderCitation(
+                    items,
+                    opts,
+                    hasProps ? props : undefined,
+                );
+            },
+        );
+        this.engine.registerFilter(
+            "bibliography",
+            async (input: unknown, ...args: unknown[]) => {
+                const { opts, join } = this.parseCslRenderArgs(args);
+                const items = await this.collectCslItems(input, "bibliography");
+                const entries = await this.cslRender.renderBibliography(
+                    items,
+                    opts,
+                );
+                return entries.join(join);
+            },
+        );
+        this.previewEngine = strictFilterEngine(this.engine, ENGINE_OPTIONS);
+    }
+
+    /** Annotation contexts carry `type` (highlight/ink/...) but no itemType. */
+    private isAnnotationContext(
+        ref: unknown,
+    ): ref is AnnotationTemplateContext {
+        return (
+            typeof ref === "object" &&
+            ref !== null &&
+            !("itemType" in ref) &&
+            typeof (ref as { type?: unknown }).type === "string" &&
+            "pageLabel" in ref
+        );
+    }
+
+    /**
+     * An annotation cites the item it annotates: annotation -> attachment
+     * (parentItem) -> top-level item, with the page label as the locator.
+     */
+    private async resolveAnnotationCite(
+        anno: AnnotationTemplateContext,
+    ): Promise<{
+        ref: { key: string; libraryID: number };
+        props?: CiteProps;
+    }> {
+        if (!anno.parentItem) {
+            throw new Error(
+                "This annotation has no parent attachment — nothing to cite",
+            );
+        }
+        const attachment = await db.items.get([
+            anno.libraryID,
+            anno.parentItem,
+        ]);
+        if (!attachment) {
+            throw new ZotFlowError(
+                ZotFlowErrorCode.RESOURCE_MISSING,
+                "LibraryTemplateService",
+                `Attachment not found: ${anno.libraryID}/${anno.parentItem}`,
+            );
+        }
+        if (!attachment.parentItem) {
+            throw new Error(
+                "This annotation belongs to a standalone attachment — there is no citable item",
+            );
+        }
+        return {
+            ref: { key: attachment.parentItem, libraryID: anno.libraryID },
+            props: anno.pageLabel
+                ? { locator: anno.pageLabel, label: "page" }
+                : undefined,
+        };
+    }
+
+    /**
+     * Parse citation/bibliography filter arguments. LiquidJS passes kwargs
+     * as 2-element `[key, value]` arrays; anything else positional is
+     * treated as the style shorthand.
+     */
+    private parseCslRenderArgs(args: unknown[]): {
+        opts: RenderOptions;
+        join: string;
+    } {
+        const opts: RenderOptions = {};
+        let join = "\n\n";
+        for (const arg of args) {
+            if (Array.isArray(arg) && arg.length === 2) {
+                const [key, value] = arg as [unknown, unknown];
+                if (value == null) continue;
+                if (typeof value !== "string" && typeof value !== "number") {
+                    throw new Error(
+                        `The "${String(key)}" argument of the citation/bibliography filter must be a string`,
+                    );
+                }
+                const str = String(value);
+                switch (key) {
+                    case "style":
+                        opts.styleId = str;
+                        break;
+                    case "locale":
+                        opts.locale = str;
+                        break;
+                    case "format":
+                        if (!CSL_OUTPUT_FORMATS.has(str)) {
+                            throw new Error(
+                                `Unknown CSL output format "${str}" — use text, html, markdown or markdown-pure`,
+                            );
+                        }
+                        opts.format = str as OutputFormat;
+                        break;
+                    case "join":
+                        join = str;
+                        break;
+                    default:
+                        throw new Error(
+                            `Unknown argument "${String(key)}" for the citation/bibliography filter — supported: style, locale, format, join`,
+                        );
+                }
+            } else if (typeof arg === "string" && arg.trim()) {
+                opts.styleId = arg.trim();
+            }
+        }
+        if (!opts.styleId) opts.styleId = this.settings.cslDefaultStyleId;
+        return { opts, join };
+    }
+
+    /** Resolve filter input (context item object or array) to CSL-JSON items. */
+    private async collectCslItems(
+        input: unknown,
+        filterName: string,
+    ): Promise<CSLItem[]> {
+        const refs = Array.isArray(input) ? input : [input];
+        if (refs.length === 0) {
+            throw new Error(
+                `The ${filterName} filter received an empty item list`,
+            );
+        }
+        return Promise.all(refs.map((ref) => this.getCslJson(ref, filterName)));
+    }
+
+    private async getCslJson(
+        ref: unknown,
+        filterName: string,
+    ): Promise<CSLItem> {
+        const key = (ref as { key?: unknown })?.key;
+        const libraryID = (ref as { libraryID?: unknown })?.libraryID;
+        if (typeof key !== "string" || typeof libraryID !== "number") {
+            throw new Error(
+                `The ${filterName} filter needs a Zotero item from the template context (an object with key and libraryID)`,
+            );
+        }
+        let item = await db.items.get([libraryID, key]);
+        if (!item) {
+            throw new ZotFlowError(
+                ZotFlowErrorCode.RESOURCE_MISSING,
+                "LibraryTemplateService",
+                `Item not found: ${libraryID}/${key}`,
+            );
+        }
+        if (
+            item.itemType === "attachment" ||
+            item.itemType === "note" ||
+            item.itemType === "annotation"
+        ) {
+            throw new Error(
+                `Item "${item.title || key}" is a ${item.itemType} — only regular items can be cited`,
+            );
+        }
+        if (!item.csljson) {
+            item = await this.backfillCslJson(item);
+        }
+        return item.csljson as CSLItem;
+    }
+
+    /**
+     * Fetch and store the CSL-JSON for an item synced before csljson was
+     * part of the pull. One-time cost per item — the stored copy is used
+     * afterwards.
+     */
+    private async backfillCslJson(
+        item: AnyIDBZoteroItem,
+    ): Promise<AnyIDBZoteroItem> {
+        const lib = await db.libraries.get(item.libraryID);
+        const libraryType = lib?.type === "group" ? "group" : "user";
+        let csljson: Record<string, unknown> | undefined;
+        try {
+            const res = await this.zotero.client
+                .library(libraryType, item.libraryID)
+                .items()
+                .get({
+                    itemKey: item.key,
+                    include: "data,csljson",
+                    includeTrashed: true,
+                });
+            csljson = (res.raw as { csljson?: Record<string, unknown> }[])[0]
+                ?.csljson;
+        } catch (e) {
+            throw ZotFlowError.wrap(
+                e,
+                ZotFlowErrorCode.NETWORK_ERROR,
+                "LibraryTemplateService",
+                `Couldn't fetch citation data for "${item.title || item.key}" — run a sync or check your connection`,
+            );
+        }
+        if (!csljson) {
+            throw new ZotFlowError(
+                ZotFlowErrorCode.RESOURCE_MISSING,
+                "LibraryTemplateService",
+                `Zotero returned no citation data for "${item.title || item.key}"`,
+            );
+        }
+        await db.items.update([item.libraryID, item.key], { csljson });
+        item.csljson = csljson;
+        return item;
     }
 
     updateSettings(newSettings: ZotFlowSettings) {
         this.settings = newSettings;
     }
 
+    /**
+     * Renders a source note. `snapshot` is what the note records about the
+     * data it was rendered from (`item-tree`, `library-version`); it must be
+     * taken before the content is read, so a change landing during the
+     * render leaves an older mark (a needless re-render later) rather than
+     * a newer one on older content (a stale note taken as current). Read
+     * here first when the caller has not taken it.
+     */
     async renderLibrarySourceNote(
         item: AnyIDBZoteroItem,
         templateContent: string | null,
-        originalFrontmatter: Record<string, any> = {},
+        originalFrontmatter: Record<string, unknown> = {},
+        snapshot?: SourceNoteSnapshot,
     ): Promise<string> {
         try {
-            const context = await this.prepareItemContext(item);
-            const template = templateContent || DEFAULT_ITEM_TEMPLATE;
-
-            // Separate Frontmatter and Body
-            const frontmatterRegex = /^---\s*([\s\S]*?)\s*---\n/;
-            const match = template.match(frontmatterRegex);
-
-            let templateFrontmatterRaw = "";
-            let body = template;
-
-            if (match) {
-                templateFrontmatterRaw = match[1] || "";
-                body = template.substring(match[0].length);
-            } else {
-                body = template;
-            }
-
-            // Parse Template Frontmatter
-            let templateFrontmatter: any = {};
-            if (templateFrontmatterRaw.trim()) {
-                try {
-                    // Render the frontmatter raw string first (as it may contain liquid tags)
-                    const renderedFrontmatterRaw =
-                        await this.engine.parseAndRender(
-                            templateFrontmatterRaw,
-                            context,
-                        );
-
-                    // Then parse the rendered string as YAML
-                    templateFrontmatter = await this.parentHost.parseYaml(
-                        renderedFrontmatterRaw,
-                    );
-                } catch (e) {
-                    // We don't throw here, just proceed with empty frontmatter from template
-                    this.parentHost.log(
-                        "error",
-                        "Failed to parse template frontmatter",
-                        "LibraryTemplateService",
-                    );
-                }
-            }
-
-            // Merge Frontmatter using the prefix protocol:
-            //   `??key` in template => preserve; only written if key absent
-            //                          in the existing note's frontmatter
-            //   bare `key`          => overwrite (default; refreshed each
-            //                          update from the rendered template)
-            // The `??` prefix is stripped from the final key.
-            const finalFrontmatter: Record<string, any> = {
-                ...originalFrontmatter,
-            };
-            for (const [rawKey, value] of Object.entries(
-                templateFrontmatter || {},
-            )) {
-                const preserve = rawKey.startsWith("??");
-                const key = preserve ? rawKey.slice(2) : rawKey;
-                if (!key) continue;
-                if (preserve) {
-                    if (!(key in finalFrontmatter)) {
-                        finalFrontmatter[key] = value;
-                    }
-                } else {
-                    finalFrontmatter[key] = value;
-                }
-            }
-
-            // Ensure Mandatory Fields (always overwritten)
-            finalFrontmatter["zotflow-locked"] = true;
-            finalFrontmatter["zotero-key"] = item.key;
-            finalFrontmatter["item-version"] = item.version;
-            finalFrontmatter["library-id"] = item.libraryID;
-
-            // Stringify Frontmatter
-            const frontmatterString =
-                await this.parentHost.stringifyYaml(finalFrontmatter);
-
-            // Render Body
-            const renderedBody = await this.engine.parseAndRender(
-                body,
-                context,
+            const { text } = await this.renderSourceNote(
+                item,
+                templateContent || DEFAULT_ITEM_TEMPLATE,
+                originalFrontmatter,
+                snapshot,
+                false,
             );
-
-            return `---\n${frontmatterString}---\n${renderedBody}`;
+            return text;
         } catch (e) {
             throw ZotFlowError.wrap(
                 e,
@@ -346,12 +669,145 @@ export class LibraryTemplateService {
         }
     }
 
-    /** Preview-render a library item with the given template content. */
+    /**
+     * The source-note render. `strict` (previews) reports frontmatter
+     * problems and positions Liquid errors in the whole template; a real
+     * render goes on without the template's frontmatter instead.
+     */
+    private async renderSourceNote(
+        item: AnyIDBZoteroItem,
+        template: string,
+        originalFrontmatter: Record<string, unknown>,
+        snapshot: SourceNoteSnapshot | undefined,
+        strict: boolean,
+    ): Promise<{
+        text: string;
+        frontmatter: Record<string, unknown>;
+        templateFrontmatter: Record<string, unknown>;
+        mandatory: Record<string, unknown>;
+    }> {
+        const marks = snapshot ?? (await takeSourceNoteSnapshot(item.libraryID, item.key));
+        const context = await this.prepareItemContext(item);
+        const { frontmatter, body, bodyLine } = splitFrontmatter(template);
+
+        const templateFrontmatter = await renderTemplateFrontmatter({
+            engine: strict ? this.previewEngine : this.engine,
+            source: frontmatter,
+            scope: context,
+            parentHost: this.parentHost,
+            strict,
+            logContext: "LibraryTemplateService",
+        });
+
+        // Merge Frontmatter using the prefix protocol:
+        //   `??key` in template => preserve; only written if key absent
+        //                          in the existing note's frontmatter
+        //   bare `key`          => overwrite (default; refreshed each
+        //                          update from the rendered template)
+        // The `??` prefix is stripped from the final key.
+        // Mandatory fields, always overwritten and written first.
+        const mandatory: Record<string, unknown> = {
+            "zotflow-locked": true,
+            "zotero-key": item.key,
+            "library-id": item.libraryID,
+            "item-version": item.version,
+        };
+        // The subtree fingerprint: Zotero does not bump an item's version
+        // when a child (attachment, annotation, note) changes.
+        if (marks.tree) mandatory["item-tree"] = marks.tree;
+        // How far this device had synced the library: a device that is
+        // behind leaves the note alone (see LibraryNoteService).
+        if (marks.libraryVersion) {
+            mandatory["library-version"] = marks.libraryVersion;
+        }
+        const finalFrontmatter = withMandatoryFirst(
+            mandatory,
+            mergeTemplateFrontmatter(originalFrontmatter, templateFrontmatter),
+        );
+
+        const frontmatterString =
+            await this.parentHost.stringifyYaml(finalFrontmatter);
+
+        const renderedBody = strict
+            ? await renderFragment(this.previewEngine, body, context, bodyLine)
+            : await this.render(body, context);
+
+        return {
+            text: `---\n${frontmatterString}---\n${renderedBody}`,
+            frontmatter: finalFrontmatter,
+            templateFrontmatter,
+            mandatory,
+        };
+    }
+
+    /**
+     * Preview a source note for the template tester, as a new note (no
+     * existing frontmatter to merge into). An empty template previews the
+     * built-in default, which is what an empty template path renders.
+     */
     async previewLibrarySourceNote(
         libraryID: number,
         key: string,
         templateContent: string,
-    ): Promise<string> {
+    ): Promise<TemplatePreviewResult> {
+        const item = await this.getPreviewItem(libraryID, key);
+        return previewResult(async (hints) => {
+            let template = templateContent;
+            if (!template.trim()) {
+                template = DEFAULT_ITEM_TEMPLATE;
+                hints.push("The template is empty; this is the built-in default template.");
+            }
+            const out = await this.renderSourceNote(item, template, {}, undefined, true);
+            const hint = mandatoryKeyHint(out.templateFrontmatter, out.mandatory);
+            if (hint) hints.push(hint);
+            return { output: out.text, frontmatter: out.frontmatter };
+        });
+    }
+
+    /** The citation scope a preview renders against; the note path is looked up as a real citation would. */
+    private async citationPreviewContext(
+        input: CitationTemplateInput,
+    ): Promise<CitationRenderContext> {
+        const item = await this.getPreviewItem(input.item.libraryID, input.item.key);
+        const notePath =
+            (await this.parentHost.getFileByKey(item.key)) ??
+            (await this.notePathService.resolveLibraryNotePath(item));
+        const context: CitationRenderContext = {
+            item: await this.mapToItemContext(item),
+            notePath,
+        };
+        if (input.annotations?.length) {
+            context.annotations = input.annotations.map((a) =>
+                this.mapToAnnotationContext(a),
+            );
+        }
+        return context;
+    }
+
+    /** The variables a source-note template sees for this item, for the template tester. */
+    async describeLibrarySourceNote(
+        libraryID: number,
+        key: string,
+    ): Promise<TemplateVariables> {
+        const item = await this.getPreviewItem(libraryID, key);
+        return describeTemplateScope(
+            { ...(await this.prepareItemContext(item)) },
+            this.engine,
+        );
+    }
+
+    /** The variables a citation template sees, for the template tester. */
+    async describeCitationTemplate(
+        input: CitationTemplateInput,
+    ): Promise<TemplateVariables> {
+        const context = await this.citationPreviewContext(input);
+        return describeTemplateScope({ ...context }, this.engine);
+    }
+
+    private async getPreviewItem(
+        libraryID: number,
+        key: string,
+    ): Promise<AnyIDBZoteroItem> {
         const item = await db.items.get([libraryID, key]);
         if (!item) {
             throw new ZotFlowError(
@@ -360,20 +816,11 @@ export class LibraryTemplateService {
                 `Item not found: ${libraryID}/${key}`,
             );
         }
-        return this.renderLibrarySourceNote(item, templateContent, {});
+        return item;
     }
 
-    /** Return the user-configured template file content, or the built-in default. */
-    async getDefaultTemplate(): Promise<string> {
-        const path = this.settings.librarySourceNoteTemplatePath;
-        if (path) {
-            try {
-                const content = await this.parentHost.readTextFile(path);
-                if (content != null) return content;
-            } catch {
-                // Fall through to default
-            }
-        }
+    /** The built-in source-note template, used while no template file is set. */
+    getBuiltInTemplate(): string {
         return DEFAULT_ITEM_TEMPLATE;
     }
 
@@ -381,31 +828,9 @@ export class LibraryTemplateService {
     async renderCitationTemplate(
         input: CitationTemplateInput,
         notePath: string,
-        format: "pandoc" | "wikilink" | "footnote" | "footnote-ref",
+        format: CitationTemplateFormat,
     ): Promise<string> {
-        let template: string;
-        if (format === "pandoc") {
-            template =
-                this.settings.citationPandocTemplate.trim() === ""
-                    ? FALLBACK_PANDOC_TEMPLATE
-                    : this.settings.citationPandocTemplate.trim();
-        } else if (format === "wikilink") {
-            template =
-                this.settings.citationWikilinkTemplate.trim() === ""
-                    ? FALLBACK_WIKILINK_TEMPLATE
-                    : this.settings.citationWikilinkTemplate.trim();
-        } else if (format === "footnote-ref") {
-            template =
-                this.settings.citationFootnoteRefTemplate.trim() === ""
-                    ? FALLBACK_FOOTNOTE_REF_TEMPLATE
-                    : this.settings.citationFootnoteRefTemplate.trim();
-        } else {
-            template =
-                this.settings.citationFootnoteTemplate.trim() === ""
-                    ? FALLBACK_FOOTNOTE_TEMPLATE
-                    : this.settings.citationFootnoteTemplate.trim();
-        }
-
+        const template = this.getDefaultCitationTemplate(format);
         if (!template) return "";
 
         const item = await db.items.get([input.item.libraryID, input.item.key]);
@@ -417,74 +842,62 @@ export class LibraryTemplateService {
             );
         }
 
-        const context = {} as any;
-        context.item = await this.mapToItemContext(item);
-        context.notePath = notePath;
+        const context: CitationRenderContext = {
+            item: await this.mapToItemContext(item),
+            notePath,
+        };
         if (input.annotations?.length) {
             context.annotations = input.annotations.map((a) =>
                 this.mapToAnnotationContext(a),
             );
         }
 
-        return this.engine.parseAndRender(template, context);
+        return this.render(template, context);
     }
 
-    /** Preview a citation template for a library item (no file creation). */
+    /**
+     * Preview a citation template for the template tester. An empty template
+     * previews the built-in fallback for `format`, which is what an empty
+     * setting renders.
+     */
     async previewCitationTemplate(
         input: CitationTemplateInput,
         template: string,
-    ): Promise<string> {
-        const item = await db.items.get([input.item.libraryID, input.item.key]);
-        if (!item) {
-            throw new ZotFlowError(
-                ZotFlowErrorCode.RESOURCE_MISSING,
-                "LibraryTemplateService",
-                `Item not found: ${input.item.libraryID}/${input.item.key}`,
-            );
-        }
-        const notePath =
-            await this.notePathService.resolveLibraryNotePath(item);
-        const context = {} as any;
-        context.item = await this.mapToItemContext(item);
-        context.notePath = notePath;
-        if (input.annotations?.length) {
-            context.annotations = input.annotations.map((a) =>
-                this.mapToAnnotationContext(a),
-            );
-        }
-        return this.engine.parseAndRender(template, context);
+        format: CitationTemplateFormat,
+    ): Promise<TemplatePreviewResult> {
+        const context = await this.citationPreviewContext(input);
+        return previewResult(async (hints) => {
+            const { source, firstLine, firstCol } = trimmedStart(template);
+            if (!source) {
+                hints.push("The template is empty; this is the built-in default template.");
+                return {
+                    output: await renderFragment(
+                        this.previewEngine,
+                        FALLBACK_CITATION_TEMPLATES[format],
+                        context,
+                    ),
+                };
+            }
+            return {
+                output: await renderFragment(this.previewEngine, source, context, firstLine, firstCol),
+            };
+        });
     }
 
     /** Return the current citation template from settings. */
-    getDefaultCitationTemplate(
-        format: "pandoc" | "wikilink" | "footnote" | "footnote-ref",
-    ): string {
-        if (format === "pandoc") {
-            return this.settings.citationPandocTemplate.trim() === ""
-                ? FALLBACK_PANDOC_TEMPLATE
-                : this.settings.citationPandocTemplate.trim();
-        }
-        if (format === "wikilink") {
-            return this.settings.citationWikilinkTemplate.trim() === ""
-                ? FALLBACK_WIKILINK_TEMPLATE
-                : this.settings.citationWikilinkTemplate.trim();
-        }
-        if (format === "footnote-ref") {
-            return this.settings.citationFootnoteRefTemplate.trim() === ""
-                ? FALLBACK_FOOTNOTE_REF_TEMPLATE
-                : this.settings.citationFootnoteRefTemplate.trim();
-        }
-        return this.settings.citationFootnoteTemplate.trim() === ""
-            ? FALLBACK_FOOTNOTE_TEMPLATE
-            : this.settings.citationFootnoteTemplate.trim();
+    getDefaultCitationTemplate(format: CitationTemplateFormat): string {
+        const saved = this.settings[CITATION_TEMPLATE_SETTINGS[format]].trim();
+        return saved || FALLBACK_CITATION_TEMPLATES[format];
     }
 
-    private sanitizeQuotesString(str: string): string {
-        // Escape >, < into \>, \<
-        return str.replace(/>/g, "\\>").replace(/</g, "\\<");
+    /** The built-in template for `format`, used while its setting is empty. */
+    getFallbackCitationTemplate(format: CitationTemplateFormat): string {
+        return FALLBACK_CITATION_TEMPLATES[format];
     }
 
-    private async prepareItemContext(item: AnyIDBZoteroItem): Promise<any> {
+    private async prepareItemContext(
+        item: AnyIDBZoteroItem,
+    ): Promise<ItemRenderContext> {
         const itemContext = await this.mapToItemContext(item);
 
         // Build a Set of `${type}:${key}` for regions that must NOT be wrapped
@@ -555,28 +968,12 @@ export class LibraryTemplateService {
         );
 
         const annotations = (
-            await getAnnotationJson(
-                item as any,
-                this.settings.zoteroapikey,
-                (item) => item.syncStatus !== "deleted",
-            )
+            await getAnnotationJson(item, this.settings.zoteroapikey)
         ).map((a) => this.mapToAnnotationContext(a, item.key));
 
         const attachmentAnnotations = attachments.flatMap(
             (att) => att.annotations,
         );
-
-        let creatorsObj: { name: string }[] = [];
-        if (raw.meta?.creatorsSummary) {
-            if (typeof raw.meta.creatorsSummary === "string") {
-                creatorsObj = [{ name: raw.meta.creatorsSummary }];
-            }
-        } else if ((data as any).creators) {
-            creatorsObj = (data as any).creators.map((c: any) => ({
-                name:
-                    c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim(),
-            }));
-        }
 
         const itemPaths = await this.dbHelper
             .getItemPaths([
@@ -591,14 +988,23 @@ export class LibraryTemplateService {
         const relatedItems = await this.mapToRelatedItems(data);
 
         const { readStatus, rating, remaining: remainingTags } =
-            splitSpecialTags((data as any).tags || []);
+            splitSpecialTags(data.tags || []);
+
+        const metadata = buildItemMetadata(item);
+        if (metadata.title) {
+            metadata.title = metaHtml2md(metadata.title);
+        }
+        if (metadata.abstractNote) {
+            metadata.abstractNote = metaHtml2md(metadata.abstractNote);
+        }
 
         return {
+            ...metadata,
+            plainTitle: stripMarkdown(item.title || metadata.title || ""),
             key: item.key,
             version: item.version,
             libraryID: item.libraryID,
             parentItem: item.parentItem || "",
-            citationKey: item.citationKey || "",
             itemPaths: itemPaths,
             notes,
             annotations,
@@ -606,30 +1012,12 @@ export class LibraryTemplateService {
             attachments,
             relatedItems,
             itemType: item.itemType,
-            title: metaHtml2md(item.title || ""),
-            creators: creatorsObj,
-            date: (data as any).date || null,
-            year: extractYear((data as any).date),
             dateAdded: item.dateAdded,
             dateModified: item.dateModified,
-            accessDate: (data as any).accessDate || null,
-            abstractNote: metaHtml2md((data as any).abstractNote ?? ""),
-            publicationTitle: (data as any).publicationTitle,
-            publisher: (data as any).publisher,
-            place: (data as any).place,
-            volume: (data as any).volume,
-            issue: (data as any).issue,
-            pages: (data as any).pages,
-            series: (data as any).series,
-            seriesNumber: (data as any).seriesNumber,
-            edition: (data as any).edition,
-            url: (data as any).url,
-            DOI: (data as any).DOI,
-            ISBN: (data as any).ISBN,
-            ISSN: (data as any).ISSN,
             tags: remainingTags,
             readStatus,
             rating,
+            csljson: item.csljson,
         };
     }
 
@@ -654,12 +1042,14 @@ export class LibraryTemplateService {
         parentItem?: string,
     ): AnnotationTemplateContext {
         return {
-            key: annotation.id!,
+            key: annotation.id,
             libraryID: annotation.libraryID!,
-            parentItem,
+            // Citation-template inputs carry the attachment key on the
+            // AnnotationJSON itself (restored by the payload builders).
+            parentItem: parentItem ?? annotation.parentItem,
             type: annotation.type,
             authorName: annotation.authorName,
-            text: this.sanitizeQuotesString(annotation.text || ""),
+            text: this.convertService.annoHtml2md(annotation.text || ""),
             comment: this.convertService.annoHtml2md(annotation.comment || ""),
             color: annotation.color,
             pageLabel: annotation.pageLabel,
@@ -682,11 +1072,9 @@ export class LibraryTemplateService {
     }
 
     private async mapToRelatedItems(
-        data: any,
+        data: { relations?: { [k: string]: string | string[] } },
     ): Promise<RelatedItemTemplateContext[]> {
-        const rels = data?.relations as
-            | { [k: string]: string | string[] }
-            | undefined;
+        const rels = data?.relations;
         if (!rels) return [];
 
         const dc = rels["dc:relation"];
@@ -715,7 +1103,8 @@ export class LibraryTemplateService {
             let notePath: string | undefined;
             try {
                 notePath =
-                    await this.notePathService.resolveLibraryNotePath(hit);
+                    (await this.parentHost.getFileByKey(key)) ??
+                    (await this.notePathService.resolveLibraryNotePath(hit));
             } catch {
                 notePath = undefined;
             }
@@ -736,11 +1125,7 @@ export class LibraryTemplateService {
         item: IDBZoteroItem<AttachmentData>,
     ): Promise<AttachmentTemplateContext> {
         const annotations = (
-            await getAnnotationJson(
-                item,
-                this.settings.zoteroapikey,
-                (item) => item.syncStatus !== "deleted",
-            )
+            await getAnnotationJson(item, this.settings.zoteroapikey)
         ).map((a) => this.mapToAnnotationContext(a, item.key));
 
         const data = item.raw.data || {};
@@ -757,4 +1142,20 @@ export class LibraryTemplateService {
             annotations,
         };
     }
+}
+
+/** What a source note records about the data it was rendered from. */
+export interface SourceNoteSnapshot {
+    /** The item's subtree fingerprint (`item-tree`); none for a child. */
+    tree: string | undefined;
+    /** This device's sync cursor for the library (`library-version`); 0 if never synced. */
+    libraryVersion: number;
+}
+
+/** Reads the marks a source note records (see `renderLibrarySourceNote`). */
+export async function takeSourceNoteSnapshot(libraryID: number, key: string): Promise<SourceNoteSnapshot> {
+    return {
+        tree: await itemTreeFingerprint(libraryID, key),
+        libraryVersion: (await db.libraries.get(libraryID))?.itemVersion ?? 0,
+    };
 }

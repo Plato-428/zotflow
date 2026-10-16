@@ -22,7 +22,8 @@ export interface ZoteroKey {
     userID: number;
     username: string;
     displayName: string;
-    access: ZoteroKeyAccess;
+    /** Absent when the key grants no access at all. */
+    access?: ZoteroKeyAccess;
 }
 
 /** Zotero group library metadata. */
@@ -96,9 +97,11 @@ export interface ZoteroItem<T extends ZoteroItemData> {
             name: string;
             links: { [key: string]: { href: string; type: string } };
         };
-        creatorsSummary?: string;
+        creatorSummary?: string;
     };
     data: T;
+    /** CSL-JSON payload, present when fetched with include=data,csljson. */
+    csljson?: Record<string, unknown>;
 }
 
 /** Union of all possible `ZoteroItem<T>` instantiations. */
@@ -108,7 +111,7 @@ export type AnyZoteroItem = {
 
 declare module "./zotero-item" {
     interface AttachmentData {
-        linkMode: "imported_file" | "linked_file" | "imported_url";
+        linkMode: "imported_file" | "linked_file" | "imported_url" | "linked_url";
         contentType: string;
         filename: string;
         md5?: string;
@@ -123,7 +126,7 @@ declare module "./zotero-item" {
         annotationIsExternal?: boolean;
         annotationAuthorName?: string;
         annotationType: string;
-        annotationText: string;
+        annotationText: string | null;
         annotationComment: string;
         annotationColor: string;
         annotationPageLabel: string;

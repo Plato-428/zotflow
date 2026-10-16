@@ -5,12 +5,12 @@
  * fields instead of cluttering Obsidian's tag list.
  *
  * Read status tags (Zotero Reading List): full tag text is "<emoji> <label>",
- * e.g. "\ud83d\udcd9 To Read". We key off the emoji prefix only — the label
+ * e.g. "📙 To Read". We key off the emoji prefix only — the label
  * itself is never shown in Obsidian (kept identical to the emoji so a
  * narrow Bases column can be used).
  *
  * Rating tags (Ethereal Style): tag text is 1-5 repetitions of the star
- * character with no accompanying label, e.g. "\u2b50\u2b50\u2b50".
+ * character with no accompanying label, e.g. "⭐⭐⭐".
  */
 
 export interface TagLike {
@@ -20,14 +20,14 @@ export interface TagLike {
 
 /** Emoji -> full Zotero tag text (Zotero Reading List plugin). */
 export const READ_STATUS_TAGS: Record<string, string> = {
-    "\ud83d\udcd9": "\ud83d\udcd9 To Read", // 📙 To Read
-    "\ud83d\udcd7": "\ud83d\udcd7 Read", // 📗 Read
-    "\ud83d\udca1": "\ud83d\udca1 New", // 💡 New
-    "\ud83d\udcd6": "\ud83d\udcd6 In Progress", // 📖 In Progress
+    "📙": "📙 To Read", // 📙 To Read
+    "📗": "📗 Read", // 📗 Read
+    "💡": "💡 New", // 💡 New
+    "📖": "📖 In Progress", // 📖 In Progress
 };
 
 /** Rating tag text is 1-5 star characters and nothing else. */
-export const RATING_REGEX = /^\u2b50{1,5}$/;
+export const RATING_REGEX = /^⭐{1,5}$/;
 
 /** Return the registered read-status emoji this tag represents, if any. */
 export function matchReadStatusEmoji(tag: string): string | undefined {

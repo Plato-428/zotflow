@@ -14,8 +14,8 @@ export function getNotePath({
     sourceNoteFolder: string;
     libraryName: string;
 }): string {
-    const illegalRe = /[\/?<>\\:*|"]/g;
-    const controlRe = /[\x00-\x1f\x80-\x9f]/g;
+    const illegalRe = /[/?<>\\:*|"]/g;
+    const controlRe = /\p{Cc}/gu;
     const reservedRe = /^\.+$/;
     const windowsReservedRe = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
 
@@ -62,4 +62,15 @@ export function getLocalSidecarPath(
 
     const result = `${folderPart}${dirPart}${basename}.zf.json`;
     return result.replace(/\/+/g, "/");
+}
+
+/**
+ * The vault path of a source-note template file as set in the settings:
+ * `.md` is added when missing, so `Templates/Source` reads
+ * `Templates/Source.md`. Empty when no template file is set.
+ */
+export function templateFilePath(path: string): string {
+    const trimmed = path.trim();
+    if (!trimmed) return trimmed;
+    return /\.md$/i.test(trimmed) ? trimmed : `${trimmed}.md`;
 }

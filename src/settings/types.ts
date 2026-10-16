@@ -1,17 +1,12 @@
 import type { CustomReaderTheme } from "types/zotero-reader";
+import type { OutputFormat as CslOutputFormat } from "worker/csl";
 
 /** Per-library sync mode. */
 export type LibrarySyncMode = "bidirectional" | "readonly" | "ignored";
 
 /** Reader color scheme mode. */
 export type ReaderColorScheme =
-    | "light"
-    | "dark"
-    | "obsidian"
-    | "obsidian-theme";
-
-/** Settings tab identifier. */
-export type TabSection = "sync" | "webdav" | "cache" | "general" | "citation";
+    "light" | "dark" | "obsidian" | "obsidian-theme";
 
 /** Sort order for collections in the tree view. */
 export type CollectionSortOrder = "name-asc" | "name-desc";
@@ -63,7 +58,13 @@ export interface ZotFlowSettings {
     defaultDarkTheme: string;
     treeCollectionSort: CollectionSortOrder;
     treeItemSort: ItemSortOrder;
+    treeSingleClickOpen: boolean;
+    /** LiquidJS template for item titles in the tree and search; "" shows the Zotero title. */
+    itemDisplayTitleTemplate: string;
+    convertNoteLinks: boolean;
     linkedAttachmentBaseDir: string;
+    useZoteroStorage: boolean;
+    zoteroStoragePath: string;
     defaultEditableRegionLocked: boolean;
     hideEditableRegionMarkers: boolean;
     alwaysOpenChildNoteInEditor: boolean;
@@ -78,7 +79,19 @@ export interface ZotFlowSettings {
     autoPurgeTrashedSourceNotes: boolean;
     autoDisableNoteImageTextTools: boolean;
     epubFontFamily: string;
+    /** CSL renderer: default style id (slug or custom style key). */
+    cslDefaultStyleId: string;
+    /** CSL renderer: default output format. */
+    cslDefaultFormat: CslOutputFormat;
+    /** Vault-relative folder scanned for custom .csl styles; "" disables. */
+    cslStylesFolder: string;
 }
+
+/** Top-level key addressable by Obsidian's declarative settings controls. */
+export type SettingKey = Extract<keyof ZotFlowSettings, string>;
+
+/** Re-exported so main-thread settings UI can reference the format union. */
+export type { CslOutputFormat };
 
 /** Persisted reader view state for a single attachment (local or zotero). */
 export interface ViewStateEntry {
@@ -118,14 +131,19 @@ export const DEFAULT_SETTINGS: ZotFlowSettings = {
     localSidecarFolder: "",
     localSourceNotePathTemplate: "Source/Local/@{{basename}}",
     autoImportAnnotationImages: false,
-    annotationImageFolder: "",
+    annotationImageFolder: "Source/Images",
     overwriteViewer: true,
     readerColorScheme: "obsidian-theme",
     defaultLightTheme: "obsidian",
     defaultDarkTheme: "obsidian",
     treeCollectionSort: "name-asc",
     treeItemSort: "title-asc",
+    treeSingleClickOpen: false,
+    itemDisplayTitleTemplate: "",
+    convertNoteLinks: true,
     linkedAttachmentBaseDir: "",
+    useZoteroStorage: false,
+    zoteroStoragePath: "",
     defaultEditableRegionLocked: true,
     hideEditableRegionMarkers: false,
     alwaysOpenChildNoteInEditor: false,
@@ -140,6 +158,9 @@ export const DEFAULT_SETTINGS: ZotFlowSettings = {
     autoPurgeTrashedSourceNotes: false,
     autoDisableNoteImageTextTools: true,
     epubFontFamily: "",
+    cslDefaultStyleId: "apa",
+    cslDefaultFormat: "markdown",
+    cslStylesFolder: "",
 };
 
 /** Default shape of the full `data.json` blob (settings + view states). */

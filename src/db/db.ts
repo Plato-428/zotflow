@@ -1,6 +1,10 @@
 import Dexie from "dexie";
 
-import type { Table } from "dexie";
+import { itemTitle } from "db/normalize";
+import { migrateRowV7, needsWholeRow, planV7Migration, toV6Index } from "db/sync/migrate-v7";
+import { BASE_FIELD_MAP } from "types/zotero-base-fields";
+
+import type { IndexableTypePart, Table } from "dexie";
 import type {
     IDBZoteroFile,
     IDBZoteroCollection,
@@ -8,7 +12,15 @@ import type {
     AnyIDBZoteroItem,
     IDBZoteroKey,
     IDBZoteroGroup,
+    IDBCslCacheEntry,
+    IDBSyncCache,
+    IDBSyncConflict,
+    IDBSyncDeleteLog,
+    IDBSyncGroup,
+    IDBSyncQueueEntry,
+    IDBUploadJournal,
 } from "types/db-schema";
+import type { V6Index, V6Row } from "db/sync/migrate-v7";
 
 /** Dexie subclass defining the IndexedDB schema for ZotFlow. */
 export class ZotFlowDB extends Dexie {
@@ -18,6 +30,13 @@ export class ZotFlowDB extends Dexie {
     collections!: Table<IDBZoteroCollection, [number, string]>;
     libraries!: Table<IDBZoteroLibrary, number>;
     files!: Table<IDBZoteroFile, [number, string]>;
+    cslCache!: Table<IDBCslCacheEntry, string>;
+    syncCache!: Table<IDBSyncCache, [number, string]>;
+    syncDeleteLog!: Table<IDBSyncDeleteLog, [number, string]>;
+    syncConflicts!: Table<IDBSyncConflict, [number, string]>;
+    syncGroups!: Table<IDBSyncGroup, [number, string]>;
+    syncQueue!: Table<IDBSyncQueueEntry, [number, string]>;
+    uploadJournal!: Table<IDBUploadJournal, [number, string]>;
 
     constructor() {
         super("zotflow-dev");
@@ -89,6 +108,72 @@ export class ZotFlowDB extends Dexie {
         this.version(4).upgrade(async (tx) => {
             await tx.table("files").clear();
         });
+
+        // v5: Key-value cache for the CSL renderer (styles, locales, index).
+        this.version(5).stores({
+            cslCache: "&key",
+        });
+
+        // v6: Titles are now base-field mapped (case → caseName, statute →
+        // nameOfAct, email → subject). Delta sync never refetches unchanged
+        // items, so backfill the titles those types were stored without.
+        this.version(6).upgrade(async (tx) => {
+            const mappedTypes = new Set(
+                Object.keys(BASE_FIELD_MAP).filter(
+                    (type) => BASE_FIELD_MAP[type]?.title,
+                ),
+            );
+            await tx
+                .table<AnyIDBZoteroItem>("items")
+                .filter((item) => !item.title && mappedTypes.has(item.itemType))
+                .modify((item) => {
+                    if (item.raw?.data) item.title = itemTitle(item.raw.data);
+                });
+        });
+
+        // v7: the sync model of docs/sync-architecture.md. Each sync fact
+        // gets its own place: `synced` on the row, the merge base in
+        // `syncCache`, pending deletes in `syncDeleteLog`, conflicts (and
+        // remote-deletion groups) in their tables, retries in `syncQueue`,
+        // writes of unknown outcome in `uploadJournal`. `syncStatus` stays,
+        // derived. See src/db/sync/migrate-v7.ts for the mapping.
+        this.version(7)
+            .stores({
+                syncCache: "&[libraryID+key]",
+                syncDeleteLog: "&[libraryID+key]",
+                syncConflicts: "&[libraryID+key], [libraryID+group]",
+                syncGroups: "&[libraryID+id]",
+                syncQueue: "&[libraryID+key], [libraryID+lastCheck]",
+                uploadJournal: "&[libraryID+key]",
+            })
+            .upgrade(async (tx) => {
+                const items = tx.table<V6Row, [number, string]>("items");
+                // Pass 1: a light index of every row, whole copies of the
+                // few the plan needs.
+                const index: V6Index[] = [];
+                const whole: V6Row[] = [];
+                await items.each((r) => {
+                    const entry = toV6Index(r);
+                    index.push(entry);
+                    if (needsWholeRow(entry)) whole.push(r);
+                });
+                const plan = planV7Migration(index, whole, new Date().toISOString());
+
+                // Pass 2: each row rewritten in place.
+                await items.bulkDelete(plan.removed);
+                const conflictOf = new Map(
+                    plan.conflicts.map((c) => [`${c.libraryID}/${c.key}`, c]),
+                );
+                await items.toCollection().modify((r) => {
+                    migrateRowV7(r, conflictOf.get(`${r.libraryID}/${r.key}`));
+                });
+                // A full download once: 1.6.6 could drop rows the server
+                // still has, behind the cursor (see migrate-v7.ts).
+                await tx.table("libraries").toCollection().modify({ needsFullSync: true });
+                await tx.table("syncDeleteLog").bulkPut(plan.deleteLog);
+                await tx.table("syncConflicts").bulkPut(plan.conflicts);
+                await tx.table("syncGroups").bulkPut(plan.groups);
+            });
     }
 }
 
@@ -98,8 +183,10 @@ export class ZotFlowDB extends Dexie {
  * @param arrays The input array of arrays, e.g. [[1, 2], ['a', 'b']]
  * @returns All possible combinations
  */
-export function getCombinations(arrays: any[][]) {
-    return arrays.reduce(
+export function getCombinations(
+    arrays: IndexableTypePart[][],
+): IndexableTypePart[][] {
+    return arrays.reduce<IndexableTypePart[][]>(
         (acc, currList) => {
             return acc.flatMap((prevCombination) => {
                 return currList.map((item) => {

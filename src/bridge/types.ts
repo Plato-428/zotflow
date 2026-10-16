@@ -1,8 +1,10 @@
+import type { PackLease } from "enhancement-pack/types";
 import type { TFileWithoutParentAndVault } from "types/zotflow";
 import type { NotificationType } from "services/notification-service";
 import type { LogLevel } from "services/log-service";
+import type { EventArgs, WorkerEventName } from "services/event-hub";
 
-import type { ITaskInfo, ITaskOptions } from "types/tasks";
+import type { ITaskInfo } from "types/tasks";
 import type { RequestUrlParam } from "obsidian";
 
 /** Shape of an HTTP response proxied from main thread to worker. */
@@ -12,19 +14,33 @@ export interface IRequestResponse {
     arrayBuffer: ArrayBuffer;
 }
 
+/** Metadata used to identify one snapshot of an external OS file. */
+export interface ExternalFileStat {
+    mtime: number;
+    size: number;
+}
+
 /** Contract for all operations the worker can invoke on the main thread. */
+/** The subset of Obsidian's undocumented vault config ZotFlow reads. */
+export interface VaultConfig {
+    strictLineBreaks?: boolean;
+}
+
 export interface IParentProxy {
+    acquireEnhancementSdtResources(): Promise<PackLease>;
+    releaseEnhancementResources(leaseId: string): Promise<void>;
     notify(type: NotificationType, message: string): void;
     log(
         level: LogLevel,
         message: string,
         context?: string,
-        details?: any,
+        details?: unknown,
     ): void;
     request(request: RequestUrlParam): Promise<IRequestResponse>;
 
     // Platform
     isAndroidApp(): Promise<boolean>;
+    isDesktopApp(): Promise<boolean>;
 
     // Filesystem
     readTextFile(path: string): Promise<string | null>;
@@ -33,10 +49,11 @@ export interface IParentProxy {
     checkFile(path: string): Promise<{
         exists: boolean;
         path: string;
-        frontmatter?: Record<string, any>;
+        frontmatter?: Record<string, unknown>;
     }>;
     deleteFile(path: string): Promise<void>;
     readExternalBinaryFile(absolutePath: string): Promise<ArrayBuffer>;
+    statExternalFile(absolutePath: string): Promise<ExternalFileStat>;
     openFile(path: string, newLeaf: boolean): Promise<void>;
 
     // Index
@@ -44,33 +61,23 @@ export interface IParentProxy {
     indexFile(path: string): Promise<void>;
 
     // Utils
-    getVaultConfig(): Promise<Record<string, any>>;
-    parseYaml(text: string): Promise<any>;
-    stringifyYaml(obj: any): Promise<string>;
+    getVaultConfig(): Promise<VaultConfig>;
+    parseYaml(text: string): Promise<Record<string, unknown>>;
+    stringifyYaml(obj: unknown): Promise<string>;
     joinPath(...segments: string[]): Promise<string>;
     getLinkedLocalSourceNote(
         file: TFileWithoutParentAndVault,
     ): Promise<TFileWithoutParentAndVault | null>;
 
     // Tasks
-    onTaskUpdate(taskId: string, info: ITaskInfo): void;
+    /** Push a task's latest state to the main-thread TaskMonitor. */
+    reportTaskUpdate(taskId: string, info: ITaskInfo): void;
 
     // Events
-    onAnnotationChanged(
-        libraryID: number,
-        annotationKey: string,
-        parentItemKey: string,
-    ): void;
-
-    onNoteChangedByEditor(
-        libraryID: number,
-        noteKey: string,
-        parentItemKey: string,
-    ): void;
-
-    onNoteChangedByNoteView(
-        libraryID: number,
-        noteKey: string,
-        parentItemKey: string,
-    ): void;
+    /**
+     * Raise a data-change event on the main-thread EventHub, e.g.
+     * `emit("treeChanged")`. A new worker event needs only its name added
+     * to `WorkerEventName`, not a new method here.
+     */
+    emit<K extends WorkerEventName>(event: K, ...args: EventArgs<K>): void;
 }

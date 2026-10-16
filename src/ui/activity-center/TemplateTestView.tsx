@@ -1,61 +1,62 @@
 import React, { useState, useCallback, useRef, useEffect } from "react";
 import { Component, MarkdownRenderer } from "obsidian";
+import { EditorView } from "@codemirror/view";
 import { workerBridge } from "bridge";
 import { services } from "services/services";
 import { ItemPickerModal } from "ui/modals/item-picker";
 import { FilePickerModal } from "ui/modals/file-picker";
+import { TemplateWriteBackModal } from "ui/modals/template-write-back-modal";
 import { createEmbeddableMarkdownEditor } from "ui/editor/markdown-editor";
 import { ObsidianIcon } from "ui/ObsidianIcon";
 import { MultiSelectDropdown } from "ui/activity-center/MultiSelectDropdown";
+import { TemplateVariablesPanel } from "ui/activity-center/TemplateVariablesPanel";
+import {
+    applyWriteBack,
+    loadSavedTemplate,
+} from "ui/activity-center/template-store";
+import {
+    citationFormat,
+    CONTEXT_LABELS,
+    effectiveTemplate,
+    isCitationContext,
+    matchesSaved,
+    needsLibraryItem,
+    TEMPLATE_TARGETS,
+} from "ui/activity-center/template-targets";
 
 import type { EmbeddableMarkdownEditor } from "ui/editor/markdown-editor";
 import type { MultiSelectOption } from "ui/activity-center/MultiSelectDropdown";
+import type {
+    SavedTemplate,
+    TemplateContext,
+    WriteBackPlan,
+} from "ui/activity-center/template-targets";
 import type { AnyIDBZoteroItem } from "types/db-schema";
 import type { TFileWithoutParentAndVault } from "types/zotflow";
 import type { TFile } from "obsidian";
 import type { AnnotationJSON } from "types/zotero-reader";
+import type {
+    TemplateError,
+    TemplatePreviewResult,
+    TemplateVariables,
+} from "types/template-preview";
 
-type TemplateContext =
-    | "library"
-    | "local"
-    | "library-path"
-    | "local-path"
-    | "citation-pandoc"
-    | "citation-wikilink"
-    | "citation-footnote-ref"
-    | "citation-footnote";
 type OutputMode = "preview" | "source";
+type RightTab = "output" | "variables";
 
-const CONTEXT_LABELS: Record<TemplateContext, string> = {
-    library: "Library Source Note",
-    local: "Local Source Note",
-    "library-path": "Library Source Note Path",
-    "local-path": "Local Source Note Path",
-    "citation-pandoc": "Citation Pandoc",
-    "citation-wikilink": "Citation Wikilink",
-    "citation-footnote-ref": "Citation Footnote Reference",
-    "citation-footnote": "Citation Footnote Definition",
+/** The last render: which template it was, so a later edit can tell it is stale. */
+interface LastRender {
+    /** What it was rendered against (`renderInputs`). */
+    inputs: string;
+    template: string;
+    result: TemplatePreviewResult;
+}
+
+const PHASE_LABELS: Record<TemplateError["phase"], string> = {
+    parse: "Syntax error",
+    render: "Render error",
+    frontmatter: "Frontmatter error",
 };
-
-function needsLibraryItem(ctx: TemplateContext): boolean {
-    return (
-        ctx === "library" ||
-        ctx === "library-path" ||
-        ctx === "citation-pandoc" ||
-        ctx === "citation-wikilink" ||
-        ctx === "citation-footnote-ref" ||
-        ctx === "citation-footnote"
-    );
-}
-
-function isCitationContext(ctx: TemplateContext): boolean {
-    return (
-        ctx === "citation-pandoc" ||
-        ctx === "citation-wikilink" ||
-        ctx === "citation-footnote-ref" ||
-        ctx === "citation-footnote"
-    );
-}
 
 const MAX_ANNOTATION_LABEL_LENGTH = 30;
 
@@ -63,6 +64,49 @@ function annotationLabel(a: AnnotationJSON): string {
     const text = a.text || a.comment || a.id;
     if (text.length <= MAX_ANNOTATION_LABEL_LENGTH) return text;
     return text.slice(0, MAX_ANNOTATION_LABEL_LENGTH) + "…";
+}
+
+/** A rendered source note without its frontmatter, which is shown as a table instead. */
+function stripFrontmatter(text: string): string {
+    if (!text.startsWith("---\n")) return text;
+    const end = text.indexOf("\n---\n", 3);
+    return end === -1 ? text : text.slice(end + 5);
+}
+
+function propertyValue(value: unknown): string {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) return value.map(propertyValue).join(", ");
+    return JSON.stringify(value) ?? "";
+}
+
+/** Replace the editor's selection with `{{ path }}`. */
+function insertVariable(editor: EmbeddableMarkdownEditor, path: string): void {
+    const cm = editor.activeCM;
+    const { from, to } = cm.state.selection.main;
+    const text = `{{ ${path} }}`;
+    cm.dispatch({
+        changes: { from, to, insert: text },
+        selection: { anchor: from + text.length },
+        scrollIntoView: true,
+    });
+    cm.focus();
+}
+
+/** Select line `line` in the template editor, with the cursor's end at `col`. */
+function revealPosition(
+    editor: EmbeddableMarkdownEditor,
+    line: number,
+    col = 1,
+): void {
+    const cm = editor.activeCM;
+    const doc = cm.state.doc;
+    const target = doc.line(Math.max(1, Math.min(line, doc.lines)));
+    const pos = Math.min(target.from + col - 1, target.to);
+    cm.dispatch({
+        selection: { anchor: target.to, head: pos },
+        effects: EditorView.scrollIntoView(pos, { y: "center" }),
+    });
+    cm.focus();
 }
 
 /** Template testing view for the Activity Center. */
@@ -85,18 +129,45 @@ export const TemplateTestView: React.FC = () => {
     const [loadingAnnotations, setLoadingAnnotations] = useState(false);
 
     const [template, setTemplate] = useState("");
-    const [rendered, setRendered] = useState("");
+    const [saved, setSaved] = useState<SavedTemplate | null>(null);
+    const [lastRender, setLastRender] = useState<LastRender | null>(null);
     const [rendering, setRendering] = useState(false);
-    const [error, setError] = useState("");
+    const [notice, setNotice] = useState("");
     const [outputMode, setOutputMode] = useState<OutputMode>("source");
+    const [rightTab, setRightTab] = useState<RightTab>("output");
+    const [variables, setVariables] = useState<TemplateVariables | null>(null);
+    const [variablesMessage, setVariablesMessage] = useState("");
+
+    // Everything a render depends on besides the template text: a change
+    // leaves the last output outdated, and a render in flight is dropped.
+    const renderInputs = JSON.stringify([
+        context,
+        needsLibraryItem(context) && selectedItem
+            ? [selectedItem.libraryID, selectedItem.key]
+            : null,
+        needsLibraryItem(context) ? null : (selectedFile?.path ?? null),
+        isCitationContext(context) ? [...selectedAnnotationIds].sort() : [],
+    ]);
+
+    const result = lastRender?.result ?? null;
+    const rendered = result?.ok ? result.output : "";
+    const frontmatter = result?.ok ? result.frontmatter : undefined;
+    // An error or a notice takes the output's place in the Output tab.
+    const showsProblem = (result !== null && !result.ok) || notice !== "";
 
     // Refs for imperative editor instances
     const templateContainerRef = useRef<HTMLDivElement>(null);
     const outputContainerRef = useRef<HTMLDivElement>(null);
     const previewContainerRef = useRef<HTMLDivElement>(null);
     const templateEditorRef = useRef<EmbeddableMarkdownEditor | null>(null);
-    const outputEditorRef = useRef<EmbeddableMarkdownEditor | null>(null);
-    const previewComponentRef = useRef<Component | null>(null);
+
+    // Each load and render is numbered; a result that is not the latest is
+    // dropped, so a slow one cannot land after the user moved on.
+    const loadSeq = useRef(0);
+    const renderSeq = useRef(0);
+    useEffect(() => {
+        renderSeq.current++;
+    }, [renderInputs]);
 
     // Stable ref for current template value (avoids stale closures)
     const templateRef = useRef(template);
@@ -104,6 +175,21 @@ export const TemplateTestView: React.FC = () => {
 
     // Flag to skip onChange when we programmatically set the editor
     const settingProgrammatically = useRef(false);
+
+    const currentTemplate = useCallback(
+        () => templateEditorRef.current?.value ?? templateRef.current,
+        [],
+    );
+
+    /** Replace the editor's content (a newly loaded template). */
+    const loadIntoEditor = useCallback((text: string) => {
+        setTemplate(text);
+        if (templateEditorRef.current) {
+            settingProgrammatically.current = true;
+            templateEditorRef.current.set(text, false);
+            settingProgrammatically.current = false;
+        }
+    }, []);
 
     // Create template editor (left panel)
     useEffect(() => {
@@ -129,18 +215,9 @@ export const TemplateTestView: React.FC = () => {
         };
     }, []);
 
-    // Sync template state → template editor when context changes load a new default
-    useEffect(() => {
-        if (templateEditorRef.current) {
-            settingProgrammatically.current = true;
-            templateEditorRef.current.set(template, false);
-            settingProgrammatically.current = false;
-        }
-    }, [template]);
-
     // Create / recreate output editor (right panel — source mode)
     useEffect(() => {
-        if (outputMode !== "source") return;
+        if (rightTab !== "output" || outputMode !== "source" || showsProblem) return;
 
         const container = outputContainerRef.current;
         if (!container) return;
@@ -151,18 +228,16 @@ export const TemplateTestView: React.FC = () => {
             sourceMode: true,
             showLineNumbers: true,
         });
-        outputEditorRef.current = editor;
 
         return () => {
-            outputEditorRef.current = null;
             editor.destroy();
         };
-        // Recreate when switching to source or when rendered output changes
-    }, [outputMode, rendered]);
+        // Recreate when the source view is shown or the output changes
+    }, [rightTab, outputMode, rendered, showsProblem]);
 
     // Render markdown preview (right panel — preview mode)
     useEffect(() => {
-        if (outputMode !== "preview") return;
+        if (rightTab !== "output" || outputMode !== "preview" || showsProblem) return;
 
         const container = previewContainerRef.current;
         if (!container) return;
@@ -170,88 +245,56 @@ export const TemplateTestView: React.FC = () => {
         container.empty();
         const comp = new Component();
         comp.load();
-        previewComponentRef.current = comp;
 
         if (rendered) {
             void MarkdownRenderer.render(
                 services.app,
-                rendered,
+                frontmatter ? stripFrontmatter(rendered) : rendered,
                 container,
                 "",
                 comp,
             );
         } else {
-            container.createEl("span", {
+            container.createSpan({
                 text: "Click Render to see output.",
                 cls: "zotflow-template-test-placeholder",
             });
         }
 
         return () => {
-            previewComponentRef.current = null;
             comp.unload();
         };
-    }, [outputMode, rendered]);
+    }, [rightTab, outputMode, rendered, frontmatter, showsProblem]);
 
-    // Load default template when context changes
-    useEffect(() => {
-        void (async () => {
+    const reloadSaved = useCallback(
+        async (ctx: TemplateContext) => {
+            const seq = ++loadSeq.current;
+            renderSeq.current++;
             try {
-                let defaultTpl: string;
-                switch (context) {
-                    case "library":
-                        defaultTpl =
-                            await workerBridge.libraryTemplate.getDefaultTemplate();
-                        break;
-                    case "local":
-                        defaultTpl =
-                            await workerBridge.localTemplate.getDefaultTemplate();
-                        break;
-                    case "library-path":
-                        defaultTpl =
-                            await workerBridge.notePath.getDefaultPathTemplate(
-                                "library",
-                            );
-                        break;
-                    case "local-path":
-                        defaultTpl =
-                            await workerBridge.notePath.getDefaultPathTemplate(
-                                "local",
-                            );
-                        break;
-                    case "citation-pandoc":
-                        defaultTpl =
-                            await workerBridge.libraryTemplate.getDefaultCitationTemplate(
-                                "pandoc",
-                            );
-                        break;
-                    case "citation-wikilink":
-                        defaultTpl =
-                            await workerBridge.libraryTemplate.getDefaultCitationTemplate(
-                                "wikilink",
-                            );
-                        break;
-                    case "citation-footnote-ref":
-                        defaultTpl =
-                            await workerBridge.libraryTemplate.getDefaultCitationTemplate(
-                                "footnote-ref",
-                            );
-                        break;
-                    case "citation-footnote":
-                        defaultTpl =
-                            await workerBridge.libraryTemplate.getDefaultCitationTemplate(
-                                "footnote",
-                            );
-                        break;
-                }
-                setTemplate(defaultTpl);
-            } catch {
-                setTemplate("");
+                const loaded = await loadSavedTemplate(ctx);
+                if (seq !== loadSeq.current) return;
+                setSaved(loaded);
+                loadIntoEditor(effectiveTemplate(loaded));
+            } catch (e) {
+                if (seq !== loadSeq.current) return;
+                services.logService.error(
+                    "Failed to load the saved template",
+                    "TemplateTestView",
+                    e,
+                );
+                setSaved(null);
+                loadIntoEditor("");
             }
-        })();
-        setRendered("");
-        setError("");
-    }, [context]);
+            setLastRender(null);
+            setNotice("");
+        },
+        [loadIntoEditor],
+    );
+
+    // Load the saved template when the context changes
+    useEffect(() => {
+        void reloadSaved(context);
+    }, [context, reloadSaved]);
 
     // Reset item/file selection when switching between library ↔ local
     useEffect(() => {
@@ -296,12 +339,67 @@ export const TemplateTestView: React.FC = () => {
         };
     }, [selectedItem]);
 
+    // List the variables for the picked item or file
+    useEffect(() => {
+        let cancelled = false;
+        setVariables(null);
+        const pickFirst = needsLibraryItem(context)
+            ? "Pick a Zotero item to list its variables."
+            : "Pick a local file to list its variables.";
+        if (needsLibraryItem(context) ? !selectedItem : !selectedFile) {
+            setVariablesMessage(pickFirst);
+            return;
+        }
+        setVariablesMessage("Loading…");
+        void (async () => {
+            try {
+                let vars: TemplateVariables;
+                if (selectedItem && needsLibraryItem(context)) {
+                    const { libraryID, key } = selectedItem;
+                    if (context === "library") {
+                        vars = await workerBridge.libraryTemplate.describeLibrarySourceNote(libraryID, key);
+                    } else if (context === "library-path") {
+                        vars = await workerBridge.notePath.describeLibraryNotePath(libraryID, key);
+                    } else if (context === "display-title") {
+                        vars = await workerBridge.displayTitle.describe(libraryID, key);
+                    } else {
+                        const annotations = availableAnnotations.filter((a) =>
+                            selectedAnnotationIds.includes(a.id),
+                        );
+                        vars = await workerBridge.libraryTemplate.describeCitationTemplate({
+                            item: selectedItem,
+                            annotations: annotations.length > 0 ? annotations : undefined,
+                        });
+                    }
+                } else if (selectedFile) {
+                    vars =
+                        context === "local"
+                            ? await workerBridge.localTemplate.describeLocalNote(selectedFile)
+                            : await workerBridge.notePath.describeLocalNotePath(selectedFile);
+                } else {
+                    return;
+                }
+                if (!cancelled) setVariables(vars);
+            } catch (e) {
+                services.logService.error(
+                    "Failed to list template variables",
+                    "TemplateTestView",
+                    e,
+                );
+                if (!cancelled) setVariablesMessage("Could not list the variables. See the log for details.");
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [context, selectedItem, selectedFile, selectedAnnotationIds, availableAnnotations]);
+
     const handlePick = useCallback(() => {
         if (needsLibraryItem(context)) {
             new ItemPickerModal(services.app, (item: AnyIDBZoteroItem) => {
                 setSelectedItem(item);
-                setRendered("");
-                setError("");
+                setLastRender(null);
+                setNotice("");
             }).open();
         } else {
             new FilePickerModal(services.app, (file: TFile) => {
@@ -311,84 +409,84 @@ export const TemplateTestView: React.FC = () => {
                     extension: file.extension,
                     basename: file.basename,
                 });
-                setRendered("");
-                setError("");
+                setLastRender(null);
+                setNotice("");
             }).open();
         }
     }, [context]);
 
-    const handleRender = useCallback(async () => {
-        setError("");
-        setRendering(true);
-        try {
-            let result: string;
-            const currentTemplate = templateEditorRef.current
-                ? templateEditorRef.current.value
-                : template;
-
+    const preview = useCallback(
+        async (text: string): Promise<TemplatePreviewResult | null> => {
             if (needsLibraryItem(context)) {
                 if (!selectedItem) {
-                    setError("Pick a Zotero item first.");
-                    setRendering(false);
-                    return;
+                    setNotice("Pick a Zotero item first.");
+                    return null;
                 }
+                const { libraryID, key } = selectedItem;
                 if (context === "library") {
-                    result =
-                        await workerBridge.libraryTemplate.previewLibrarySourceNote(
-                            selectedItem.libraryID,
-                            selectedItem.key,
-                            currentTemplate,
-                        );
-                } else if (context === "library-path") {
-                    result = await workerBridge.notePath.previewLibraryNotePath(
-                        selectedItem.libraryID,
-                        selectedItem.key,
-                        currentTemplate,
-                    );
-                } else {
-                    const selectedAnnotations =
-                        selectedAnnotationIds.length > 0
-                            ? availableAnnotations.filter((a) =>
-                                  selectedAnnotationIds.includes(a.id),
-                              )
-                            : undefined;
-                    result =
-                        await workerBridge.libraryTemplate.previewCitationTemplate(
-                            {
-                                item: selectedItem,
-                                annotations:
-                                    selectedAnnotations &&
-                                    selectedAnnotations.length > 0
-                                        ? selectedAnnotations
-                                        : undefined,
-                            },
-                            currentTemplate,
-                        );
-                }
-            } else {
-                if (!selectedFile) {
-                    setError("Pick a local file first.");
-                    setRendering(false);
-                    return;
-                }
-                if (context === "local") {
-                    result = await workerBridge.localTemplate.previewLocalNote(
-                        selectedFile,
-                        currentTemplate,
-                    );
-                } else {
-                    result = await workerBridge.notePath.previewLocalNotePath(
-                        selectedFile,
-                        currentTemplate,
+                    return workerBridge.libraryTemplate.previewLibrarySourceNote(
+                        libraryID,
+                        key,
+                        text,
                     );
                 }
+                if (context === "library-path") {
+                    return workerBridge.notePath.previewLibraryNotePath(
+                        libraryID,
+                        key,
+                        text,
+                    );
+                }
+                if (context === "display-title") {
+                    return workerBridge.displayTitle.preview(libraryID, key, text);
+                }
+                if (isCitationContext(context)) {
+                    const annotations = availableAnnotations.filter((a) =>
+                        selectedAnnotationIds.includes(a.id),
+                    );
+                    return workerBridge.libraryTemplate.previewCitationTemplate(
+                        {
+                            item: selectedItem,
+                            annotations:
+                                annotations.length > 0 ? annotations : undefined,
+                        },
+                        text,
+                        citationFormat(context),
+                    );
+                }
+                return null;
             }
+            if (!selectedFile) {
+                setNotice("Pick a local file first.");
+                return null;
+            }
+            return context === "local"
+                ? workerBridge.localTemplate.previewLocalNote(selectedFile, text)
+                : workerBridge.notePath.previewLocalNotePath(selectedFile, text);
+        },
+        [
+            context,
+            selectedItem,
+            selectedFile,
+            selectedAnnotationIds,
+            availableAnnotations,
+        ],
+    );
 
-            setRendered(result);
+    const handleRender = useCallback(async () => {
+        const seq = ++renderSeq.current;
+        setNotice("");
+        setRightTab("output");
+        setRendering(true);
+        const text = currentTemplate();
+        try {
+            const result = await preview(text);
+            if (seq !== renderSeq.current) return;
+            if (result) setLastRender({ inputs: renderInputs, template: text, result });
         } catch (e) {
-            const msg =
-                e instanceof Error ? e.message : "Template rendering failed";
-            setError(msg);
+            if (seq !== renderSeq.current) return;
+            setLastRender(null);
+            setNotice("Could not render the template. See the log for details.");
             services.logService.error(
                 "Template preview failed",
                 "TemplateTestView",
@@ -397,14 +495,58 @@ export const TemplateTestView: React.FC = () => {
         } finally {
             setRendering(false);
         }
-    }, [
-        context,
-        selectedItem,
-        selectedFile,
-        template,
-        selectedAnnotationIds,
-        availableAnnotations,
-    ]);
+    }, [renderInputs, preview, currentTemplate]);
+
+    const handleSave = useCallback(() => {
+        // `saved` must be this context's: a template is saved to its own target.
+        if (!saved || saved.context !== context) return;
+        const text = currentTemplate();
+        new TemplateWriteBackModal(
+            services.app,
+            saved,
+            text,
+            async (plan: WriteBackPlan) => {
+                try {
+                    await applyWriteBack(plan);
+                } catch (e) {
+                    services.logService.error(
+                        "Failed to save the template",
+                        "TemplateTestView",
+                        e,
+                    );
+                    services.notificationService.notify(
+                        "error",
+                        "Failed to save the template.",
+                    );
+                    return false;
+                }
+                services.notificationService.notify("success", "Template saved");
+                const loaded = await loadSavedTemplate(saved.context);
+                // The context may have changed while the modal was open.
+                setSaved((prev) =>
+                    prev?.context === loaded.context ? loaded : prev,
+                );
+                return true;
+            },
+        ).open();
+    }, [saved, context, currentTemplate]);
+
+    // The output belongs to the template as it was rendered; after an edit
+    // it is stale, and saving needs a fresh successful render.
+    const renderIsCurrent =
+        lastRender !== null &&
+        lastRender.inputs === renderInputs &&
+        lastRender.template === template;
+    const isSaved = saved !== null && matchesSaved(template, saved);
+    let saveBlocker = "";
+    if (!saved || saved.context !== context) {
+        saveBlocker = "The saved template could not be loaded.";
+    }
+    else if (isSaved) saveBlocker = "This is the saved template.";
+    else if (!renderIsCurrent || !lastRender.result.ok) {
+        saveBlocker = "Render this template without errors first.";
+    }
+    const target = TEMPLATE_TARGETS[context];
 
     const selectionLabel = needsLibraryItem(context)
         ? (selectedItem?.title ?? "No item selected")
@@ -416,6 +558,9 @@ export const TemplateTestView: React.FC = () => {
             label: `[${a.type}] ${annotationLabel(a)}`,
         }),
     );
+
+    const error = result && !result.ok ? result.error : null;
+    const hints = result?.hints ?? [];
 
     return (
         <div className="zotflow-template-test">
@@ -482,22 +627,31 @@ export const TemplateTestView: React.FC = () => {
                         <span className="zotflow-template-test-section-header">
                             Template
                         </span>
-                        <button
-                            className="clickable-icon"
-                            aria-label="Copy template"
-                            onClick={() => {
-                                const value = templateEditorRef.current
-                                    ? templateEditorRef.current.value
-                                    : template;
-                                void navigator.clipboard.writeText(value);
-                                services.notificationService.notify(
-                                    "success",
-                                    "Template copied to clipboard",
-                                );
-                            }}
-                        >
-                            <ObsidianIcon icon="copy" />
-                        </button>
+                        <div className="zotflow-template-test-mode-toggle">
+                            <button
+                                className="clickable-icon"
+                                aria-label="Reload the saved template"
+                                disabled={isSaved}
+                                onClick={() => void reloadSaved(context)}
+                            >
+                                <ObsidianIcon icon="rotate-ccw" />
+                            </button>
+                            <button
+                                className="clickable-icon"
+                                aria-label="Copy template"
+                                onClick={() => {
+                                    void navigator.clipboard.writeText(
+                                        currentTemplate(),
+                                    );
+                                    services.notificationService.notify(
+                                        "success",
+                                        "Template copied to clipboard",
+                                    );
+                                }}
+                            >
+                                <ObsidianIcon icon="copy" />
+                            </button>
+                        </div>
                     </div>
                     <div
                         ref={templateContainerRef}
@@ -508,10 +662,29 @@ export const TemplateTestView: React.FC = () => {
                 {/* Right: Output with preview/source toggle */}
                 <div className="zotflow-template-test-panel">
                     <div className="zotflow-template-test-panel-header">
-                        <span className="zotflow-template-test-section-header">
-                            Output
-                        </span>
-                        <div className="zotflow-template-test-mode-toggle">
+                        <div className="zotflow-template-test-tabs">
+                            <button
+                                className={`zotflow-template-test-section-header ${rightTab === "output" ? "is-active" : ""}`}
+                                onClick={() => setRightTab("output")}
+                            >
+                                Output
+                                {lastRender && !renderIsCurrent && (
+                                    <span className="zotflow-template-test-stale">
+                                        {" "}
+                                        · outdated
+                                    </span>
+                                )}
+                            </button>
+                            <button
+                                className={`zotflow-template-test-section-header ${rightTab === "variables" ? "is-active" : ""}`}
+                                onClick={() => setRightTab("variables")}
+                            >
+                                Variables
+                            </button>
+                        </div>
+                        <div
+                            className={`zotflow-template-test-mode-toggle ${rightTab === "output" ? "" : "is-hidden"}`}
+                        >
                             <button
                                 className={`clickable-icon ${outputMode === "source" ? "is-active" : ""}`}
                                 onClick={() => setOutputMode("source")}
@@ -529,30 +702,125 @@ export const TemplateTestView: React.FC = () => {
                         </div>
                     </div>
 
-                    {outputMode === "source" && (
+                    {rightTab === "variables" && (
+                        <div className="zotflow-template-test-output zotflow-template-test-variables">
+                            <TemplateVariablesPanel
+                                variables={variables}
+                                message={variablesMessage}
+                                // A path template has the item's variables at the root too.
+                                openItem={context !== "library-path"}
+                                onInsert={(path) => {
+                                    if (templateEditorRef.current) {
+                                        insertVariable(templateEditorRef.current, path);
+                                    }
+                                }}
+                            />
+                        </div>
+                    )}
+
+                    {rightTab === "output" && (error || notice) && (
+                        <div className="zotflow-template-test-output zotflow-template-test-error-view">
+                            {error ? (
+                                <>
+                                    <div className="zotflow-template-test-error-head">
+                                        <ObsidianIcon icon="alert-octagon" />
+                                        <strong>{PHASE_LABELS[error.phase]}</strong>
+                                        {error.line !== undefined && (
+                                            <button
+                                                className="zotflow-template-test-error-position"
+                                                onClick={() => {
+                                                    if (templateEditorRef.current && error.line !== undefined) {
+                                                        revealPosition(
+                                                            templateEditorRef.current,
+                                                            error.line,
+                                                            error.col,
+                                                        );
+                                                    }
+                                                }}
+                                            >
+                                                Line {error.line}
+                                                {error.col !== undefined && `, column ${error.col}`}
+                                            </button>
+                                        )}
+                                    </div>
+                                    <pre className="zotflow-template-test-error-message">
+                                        {error.message}
+                                    </pre>
+                                    {error.renderedFrontmatter !== undefined && (
+                                        <details className="zotflow-template-test-error-detail" open>
+                                            <summary>Rendered frontmatter</summary>
+                                            <pre>{error.renderedFrontmatter}</pre>
+                                        </details>
+                                    )}
+                                </>
+                            ) : (
+                                <div className="zotflow-template-test-error-head">
+                                    <ObsidianIcon icon="info" />
+                                    <span>{notice}</span>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {rightTab === "output" && !error && !notice && hints.length > 0 && (
+                        <ul className="zotflow-template-test-hints">
+                            {hints.map((hint) => (
+                                <li key={hint}>
+                                    <ObsidianIcon icon="info" />
+                                    <span>{hint}</span>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+
+                    {rightTab === "output" && !error && !notice && outputMode === "source" && (
                         <div
                             ref={outputContainerRef}
                             className="zotflow-template-test-output"
                         />
                     )}
-                    {outputMode === "preview" && (
-                        <div
-                            ref={previewContainerRef}
-                            className="zotflow-template-test-output zotflow-template-test-preview"
-                        />
+                    {rightTab === "output" && !error && !notice && outputMode === "preview" && (
+                        <div className="zotflow-template-test-output zotflow-template-test-preview">
+                            {frontmatter && (
+                                <table className="zotflow-template-test-properties">
+                                    <tbody>
+                                        {Object.entries(frontmatter).map(
+                                            ([key, value]) => (
+                                                <tr key={key}>
+                                                    <th>{key}</th>
+                                                    <td>{propertyValue(value)}</td>
+                                                </tr>
+                                            ),
+                                        )}
+                                    </tbody>
+                                </table>
+                            )}
+                            <div ref={previewContainerRef} />
+                        </div>
                     )}
                 </div>
             </div>
 
-            {error && (
-                <div className="zotflow-template-test-error">{error}</div>
-            )}
-
             {/* ── Actions ── */}
             <div className="zotflow-template-test-actions">
+                <span className="zotflow-template-test-status">
+                    {saved &&
+                        (isSaved
+                            ? saved.stored?.trim()
+                                ? "Saved template"
+                                : "Built-in template (nothing saved)"
+                            : "Unsaved changes")}
+                </span>
+                <button
+                    onClick={handleSave}
+                    disabled={saveBlocker !== ""}
+                    aria-label={saveBlocker || `Save to ${target.label}`}
+                >
+                    {target.kind === "file" ? "Save to File" : "Save to Settings"}
+                </button>
                 <button
                     className="mod-cta"
-                    onClick={handleRender}
+                    onClick={() => void handleRender()}
                     disabled={rendering}
                 >
                     {rendering ? "Rendering..." : "Render"}

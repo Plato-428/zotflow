@@ -1,5 +1,8 @@
+import Dexie from "dexie";
+
 import { db } from "db/db";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
+import { groupLibraryAccess, userLibraryAccess } from "utils/key-access";
 
 import type { IParentProxy } from "bridge/types";
 import type { ZoteroAPIService } from "./zotero";
@@ -21,10 +24,11 @@ export interface LibraryRow {
     /** The currently configured mode from settings (falls back to defaultMode). */
     mode: LibrarySyncMode;
     syncedAt: string;
-    changedCount: number;
+    /** Changes waiting to be uploaded: created and edited items, deletions (conflicts excluded). */
+    pushCount: number;
+    /** Conflicts to resolve; a remote deletion's members count once. */
+    conflictCount: number;
 }
-
-const DIRTY_STATUSES = ["created", "updated", "deleted", "conflict"] as const;
 
 /**
  * Worker-side service for Zotero API key, group, and library metadata.
@@ -58,14 +62,14 @@ export class KeyService {
         const rows: LibraryRow[] = [];
 
         // Personal library
-        if (keyInfo.access.user) {
-            const u = keyInfo.access.user;
-            const canRead = !!u.library;
-            const canWrite = !!u.write;
-            const hasNotesAccess = !!(u.library && u.notes);
+        if (keyInfo.access?.user) {
+            const u = userLibraryAccess(keyInfo);
+            const canRead = u.library;
+            const canWrite = u.write;
+            const hasNotesAccess = u.notes;
             const { defaultMode, allowed } = getModes(canRead, canWrite);
             const libState = await db.libraries.get(keyInfo.userID);
-            const changedCount = await this.countChangedItems(keyInfo.userID);
+            const counts = await this.countLocalChanges(keyInfo.userID);
 
             rows.push({
                 id: keyInfo.userID,
@@ -80,7 +84,7 @@ export class KeyService {
                     settings.librariesConfig[keyInfo.userID]?.mode ??
                     defaultMode,
                 syncedAt: libState?.syncedAt ?? "",
-                changedCount,
+                ...counts,
             });
         }
 
@@ -89,17 +93,13 @@ export class KeyService {
             const group = await db.groups.get(groupId);
             if (!group) continue;
 
-            const gAccess = keyInfo.access.groups;
-            const specific = gAccess?.[groupId];
-            const all = gAccess?.all;
-            const canRead = specific?.library ?? all?.library ?? false;
-            const canWrite = specific?.write ?? all?.write ?? false;
-            // Group libraries don't have a separate notes flag — notes access
-            // follows library access.
-            const hasNotesAccess = canRead;
+            const access = groupLibraryAccess(keyInfo, groupId);
+            const canRead = access.library;
+            const canWrite = access.write;
+            const hasNotesAccess = access.notes;
             const { defaultMode, allowed } = getModes(canRead, canWrite);
             const libState = await db.libraries.get(group.id);
-            const changedCount = await this.countChangedItems(group.id);
+            const counts = await this.countLocalChanges(group.id);
 
             rows.push({
                 id: group.id,
@@ -112,7 +112,7 @@ export class KeyService {
                 defaultMode,
                 mode: settings.librariesConfig[group.id]?.mode ?? defaultMode,
                 syncedAt: libState?.syncedAt ?? "",
-                changedCount,
+                ...counts,
             });
         }
 
@@ -142,6 +142,7 @@ export class KeyService {
 
         const groups: ZoteroGroup[] = await this.zoteroApi.getGroups(
             verifiedKeyInfo.userID,
+            apiKey,
         );
 
         // Persist key + groups
@@ -184,20 +185,26 @@ export class KeyService {
         return { keyInfo: verifiedKeyInfo, username: verifiedKeyInfo.username };
     }
 
-    // Count items + collections with a non-synced status for a library.
-    private async countChangedItems(libraryID: number): Promise<number> {
-        let total = 0;
-        for (const status of DIRTY_STATUSES) {
-            total += await db.items
-                .where("[libraryID+syncStatus]")
-                .equals([libraryID, status])
-                .count();
-            total += await db.collections
-                .where("[libraryID+syncStatus]")
-                .equals([libraryID, status])
-                .count();
-        }
-        return total;
+    // Count items + collections with a non-synced status for a library,
+    // plus local deletes not yet uploaded (their rows are already gone).
+    /** What a sync would upload from a library, and what waits on the user. */
+    private async countLocalChanges(libraryID: number): Promise<{ pushCount: number; conflictCount: number }> {
+        const range: [[number, unknown], [number, unknown]] = [
+            [libraryID, Dexie.minKey],
+            [libraryID, Dexie.maxKey],
+        ];
+        const [created, updated, deletes, conflicts] = await Promise.all([
+            db.items.where("[libraryID+syncStatus]").equals([libraryID, "created"]).count(),
+            db.items.where("[libraryID+syncStatus]").equals([libraryID, "updated"]).count(),
+            db.syncDeleteLog.where("[libraryID+key]").between(...range).primaryKeys(),
+            db.syncConflicts.where("[libraryID+key]").between(...range).toArray(),
+        ]);
+        // A pending delete in conflict waits on the user, not on a sync.
+        const inConflict = new Set(conflicts.map((c) => c.key));
+        const pendingDeletes = deletes.filter(([, key]) => !inConflict.has(key)).length;
+        // A remote deletion's members are resolved together: one conflict.
+        const conflictCount = new Set(conflicts.map((c) => (c.group ? `group:${c.group}` : c.key))).size;
+        return { pushCount: created + updated + pendingDeletes, conflictCount };
     }
 }
 

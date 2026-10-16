@@ -4,17 +4,15 @@
  *
  * Annotation comments use a restricted HTML subset: `<b>`, `<i>`, `<sub>`, `<sup>`.
  * In Obsidian markdown the first two map to native syntax (`**` / `*`), while
- * `<sub>` and `<sup>` map to Extended Markdown Syntax (`~` / `^`) when the
- * "Extended Markdown Syntax" plugin is active.
+ * `<sub>` and `<sup>` pass through as raw inline HTML (Obsidian renders them).
  *
  * Metadata fields (title, abstractNote) are plain strings in Zotero's API but
- * may contain `<i>` / `<b>` tags added by the user for formatting.  The
+ * may contain `<i>` / `<b>` tags added by the user for formatting. The
  * `metaHtml2md` / `metaMd2html` pair handles that lighter case without the
  * `<` / `>` escaping needed for the blockquote-embedded annotation comments.
  *
  * These converters are intentionally simple — no AST parsing is needed for
- * a handful of tags. They live separately from the full unified pipeline used
- * by notes.
+ * four tags. They live separately from the full unified pipeline used by notes.
  */
 
 /**
@@ -31,32 +29,26 @@
 export function metaHtml2md(text: string): string {
     if (!text) return "";
     let md = text;
-    // Trim whitespace inside the tags before wrapping.
-    // If a trailing space was inside the tag (e.g. Zotero Ctrl+I captures
-    // the space after the selected word), move it outside the closing
-    // delimiter — but only when there isn't already a space there, to avoid
-    // doubling up.  Leading whitespace inside a tag is simply discarded.
     md = md.replace(
         /<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>/gi,
-        (match: string, content: string, offset: number, str: string) => {
-            const inner = content.trim();
-            const hadTrailing = /\s$/.test(content);
-            const nextChar = (str[offset + match.length] as string | undefined) ?? "";
-            const suffix = hadTrailing && nextChar !== " " ? " " : "";
-            return `**${inner}**${suffix}`;
+        (_, inner: string) => {
+            const trimmed = inner.trim();
+            if (!trimmed) return inner;
+            const leading = /^(\s*)/.exec(inner)?.[1] || "";
+            const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+            return `${leading}**${trimmed}**${trailing}`;
         },
     );
     md = md.replace(
         /<(?:i|em)>([\s\S]*?)<\/(?:i|em)>/gi,
-        (match: string, content: string, offset: number, str: string) => {
-            const inner = content.trim();
-            const hadTrailing = /\s$/.test(content);
-            const nextChar = (str[offset + match.length] as string | undefined) ?? "";
-            const suffix = hadTrailing && nextChar !== " " ? " " : "";
-            return `*${inner}*${suffix}`;
+        (_, inner: string) => {
+            const trimmed = inner.trim();
+            if (!trimmed) return inner;
+            const leading = /^(\s*)/.exec(inner)?.[1] || "";
+            const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+            return `${leading}*${trimmed}*${trailing}`;
         },
     );
-    // Strip any remaining HTML tags
     md = md.replace(/<[^>]*>/g, "");
     return md;
 }
@@ -74,20 +66,54 @@ export function metaHtml2md(text: string): string {
 export function metaMd2html(text: string): string {
     if (!text) return "";
     let html = text;
-    // Bold first (** before *)
     html = html.replace(/\*\*([\s\S]*?)\*\*/g, "<b>$1</b>");
-    // Italic: single *, not adjacent to another *
     html = html.replace(/(?<!\*)\*(?!\*)([\s\S]*?)(?<!\*)\*(?!\*)/g, "<i>$1</i>");
     return html;
 }
+
+/**
+ * Strip common Markdown formatting (bold, italic, strikethrough, highlights,
+ * underline, inline code, and HTML tags) from a string.
+ *
+ * Useful for YAML frontmatter fields (like `title`) where formatting marks
+ * become clutter.
+ */
+export function stripMarkdown(text: string): string {
+    if (!text) return "";
+    let clean = text;
+    // Strip HTML tags first if any are present
+    clean = clean.replace(/<[^>]*>/g, "");
+    // Bold / italic combinations (***text*** or ___text___)
+    clean = clean.replace(/(\*\*\*|___)([\s\S]*?)\1/g, "$2");
+    // Bold (**text** or __text__)
+    clean = clean.replace(/(\*\*|__)([\s\S]*?)\1/g, "$2");
+    // Italic (*text* or _text_)
+    clean = clean.replace(/(?<!\*)\*(?!\*)([\s\S]*?)(?<!\*)\*(?!\*)/g, "$1");
+    clean = clean.replace(/(?<!_)_(?!_)([\s\S]*?)(?<!_)_(?!_)/g, "$1");
+    // Strikethrough (~~text~~)
+    clean = clean.replace(/~~([\s\S]*?)~~/g, "$1");
+    // Extended MD highlight (=={color}text== or ==text==)
+    clean = clean.replace(/==(?:\{[^{}]*\})?([\s\S]*?)==/g, "$1");
+    // Extended MD underline (++text++)
+    clean = clean.replace(/\+\+([\s\S]*?)\+\+/g, "$1");
+    // Inline code (`text`)
+    clean = clean.replace(/`([^`\n]*)`/g, "$1");
+    return clean;
+}
+
+
+// Placeholders for <sub>/<sup> tags during escaping
+const PH_SUB_OPEN = "\x00SUB_O\x00";
+const PH_SUB_CLOSE = "\x00SUB_C\x00";
+const PH_SUP_OPEN = "\x00SUP_O\x00";
+const PH_SUP_CLOSE = "\x00SUP_C\x00";
 
 /**
  * Convert annotation comment HTML → markdown for display in source notes.
  *
  * - `<b>text</b>` → `**text**`
  * - `<i>text</i>` → `*text*`
- * - `<sub>text</sub>` → `~text~`  (Extended Markdown Syntax)
- * - `<sup>text</sup>` → `^text^`  (Extended Markdown Syntax)
+ * - `<sub>`, `<sup>` → kept as-is (Obsidian renders inline HTML)
  * - `>` and `<` outside of preserved tags are escaped to prevent
  *   accidental blockquote / HTML injection in markdown
  * - Newlines preserved
@@ -98,20 +124,38 @@ export function annoHtml2md(html: string): string {
     let md = html;
 
     // Bold: <b>...</b> → **...**
-    md = md.replace(/<b>([\s\S]*?)<\/b>/gi, "**$1**");
+    md = md.replace(/<b>([\s\S]*?)<\/b>/gi, (_, inner: string) => {
+        const trimmed = inner.trim();
+        if (!trimmed) return inner;
+        const leading = /^(\s*)/.exec(inner)?.[1] || "";
+        const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+        return `${leading}**${trimmed}**${trailing}`;
+    });
 
     // Italic: <i>...</i> → *...*
-    md = md.replace(/<i>([\s\S]*?)<\/i>/gi, "*$1*");
+    md = md.replace(/<i>([\s\S]*?)<\/i>/gi, (_, inner: string) => {
+        const trimmed = inner.trim();
+        if (!trimmed) return inner;
+        const leading = /^(\s*)/.exec(inner)?.[1] || "";
+        const trailing = /(\s*)$/.exec(inner)?.[1] || "";
+        return `${leading}*${trimmed}*${trailing}`;
+    });
 
-    // Subscript: <sub>...</sub> → ~...~  (Extended Markdown Syntax)
-    md = md.replace(/<sub>([\s\S]*?)<\/sub>/gi, "~$1~");
-
-    // Superscript: <sup>...</sup> → ^...^  (Extended Markdown Syntax)
-    md = md.replace(/<sup>([\s\S]*?)<\/sup>/gi, "^$1^");
+    // Protect <sub>/<sup> tags with placeholders before escaping < >
+    md = md.replace(/<sub>/gi, PH_SUB_OPEN);
+    md = md.replace(/<\/sub>/gi, PH_SUB_CLOSE);
+    md = md.replace(/<sup>/gi, PH_SUP_OPEN);
+    md = md.replace(/<\/sup>/gi, PH_SUP_CLOSE);
 
     // Escape stray < and > so they don't produce markdown syntax
     md = md.replace(/</g, "\\<");
     md = md.replace(/>/g, "\\>");
+
+    // Restore <sub>/<sup> tags
+    md = md.replace(new RegExp(PH_SUB_OPEN, "g"), "<sub>");
+    md = md.replace(new RegExp(PH_SUB_CLOSE, "g"), "</sub>");
+    md = md.replace(new RegExp(PH_SUP_OPEN, "g"), "<sup>");
+    md = md.replace(new RegExp(PH_SUP_CLOSE, "g"), "</sup>");
 
     return md;
 }
@@ -121,8 +165,7 @@ export function annoHtml2md(html: string): string {
  *
  * - `**text**` → `<b>text</b>`
  * - `*text*`   → `<i>text</i>`
- * - `~text~`   → `<sub>text</sub>`  (Extended Markdown Syntax)
- * - `^text^`   → `<sup>text</sup>`  (Extended Markdown Syntax)
+ * - `<sub>`, `<sup>` → kept as-is
  * - Strips any other HTML tags (safety)
  */
 export function annoMd2html(md: string): string {
@@ -142,12 +185,6 @@ export function annoMd2html(md: string): string {
         /(?<!\*)\*(?!\*)([\s\S]*?)(?<!\*)\*(?!\*)/g,
         "<i>$1</i>",
     );
-
-    // Subscript: ~...~ → <sub>...</sub>  (single tilde, not double)
-    html = html.replace(/(?<!~)~([^~]+)~(?!~)/g, "<sub>$1</sub>");
-
-    // Superscript: ^...^ → <sup>...</sup>
-    html = html.replace(/\^([^^]+)\^/g, "<sup>$1</sup>");
 
     // Strip any HTML tags except the allowed subset
     html = html.replace(

@@ -9,7 +9,7 @@
 
 | Field                 | Value                                             |
 | --------------------- | ------------------------------------------------- |
-| **Name**              | ZotFlow (`obsidian-zotflow`)                      |
+| **Name**              | ZotFlow (plugin id `zotflow`, npm `obsidian-zotflow`) |
 | **Type**              | Obsidian Community Plugin                         |
 | **Language**          | TypeScript (strict mode)                          |
 | **Bundler**           | esbuild (custom config in `esbuild.config.mjs`)   |
@@ -37,7 +37,8 @@ processing.
 │       │     ├── IndexService   (vault file → zotero-key)     │
 │       │     ├── LogService     (in-memory log buffer)        │
 │       │     ├── NotificationService  (styled Notice)         │
-│       │     └── TaskMonitor    (pub/sub task updates)        │
+│       │     ├── TaskMonitor    (task state for the UI)       │
+│       │     └── EventHub       (data-change events)          │
 │       │                                                      │
 │       ├── ui/                                                │
 │       │     ├── reader/   (ZoteroReaderView, IframeReaderBridge, │
@@ -70,7 +71,7 @@ processing.
 │       │     ├── library-template.ts (LiquidJS library templates) │
 │       │     ├── local-template.ts (LiquidJS local templates) │
 │       │     ├── tree-view.ts    (tree topology builder)      │
-│       │     ├── pdf-processor.ts (nested PDF.js Worker)      │
+│       │     ├── document-worker.ts (Zotero Document Worker)  │
 │       │     ├── annotation.ts   (reader annotation CRUD)     │
 │       │     ├── key.ts          (API key/library metadata)   │
 │       │     └── db-helper.ts        (general-purpose DB queries) │
@@ -84,7 +85,10 @@ processing.
 │       ├── db.ts          (schema: keys, groups, items,       │
 │       │                   collections, libraries, files)     │
 │       ├── normalize.ts   (API response → IDB shape)          │
-│       └── annotation.ts  (IDB ↔ AnnotationJSON conversion)   │
+│       ├── mutate.ts      (local item writes: mutateItem)     │
+│       ├── annotation.ts  (IDB ↔ AnnotationJSON conversion)   │
+│       └── sync/          (sync model: reconcile, decide,     │
+│                           commit, model, migrate-v7)         │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -97,7 +101,7 @@ processing.
 | Worker → Main        | `Comlink.proxy(parentHost)` callbacks | `bridge/parent-host.ts`                 |
 | Main → Reader iframe | `penpal` (connectToChild)             | `ui/reader/bridge.ts`                   |
 | Reader iframe → Main | `penpal` (connectToParent)            | `reader/reader/src/obsidian-adapter.js` |
-| Worker → PDF Worker  | raw `postMessage`/`onmessage`         | `worker/services/pdf-processor.ts`      |
+| Worker → Document Worker | raw `postMessage`/`onmessage`     | `worker/services/document-worker.ts`   |
 
 ### 2.2 Data flow (Sync example)
 
@@ -105,7 +109,8 @@ processing.
 2. `TaskManager` creates `SyncTask`, calls `SyncService.startSync(signal)`
 3. `SyncService` calls `ZoteroAPIService` (proxied through `ParentHost.request` to bypass CORS)
 4. Fetched data normalized via `db/normalize.ts` → stored in Dexie tables
-5. `ParentHost.onTaskUpdate()` pushes progress to `TaskMonitor` on main thread
+5. `ParentHost.reportTaskUpdate()` pushes progress to `TaskMonitor` on main thread;
+   when the sync ends, `TaskMonitor` emits `EventHub.syncFinished`
 6. UI components (TreeView, ActivityCenter) re-fetch via `workerBridge.treeView`
 
 ### 2.3 Reader architecture
@@ -135,9 +140,7 @@ The sidecar format:
 ```json
 {
     "version": 1,
-    "annotations": [
-        /* AnnotationJSON[] */
-    ]
+    "annotations": [/* AnnotationJSON[] */]
 }
 ```
 
@@ -256,6 +259,9 @@ src/
 │   ├── parent-host.ts              # ParentHost — main-thread API for Worker
 │   └── types.ts                    # IParentProxy interface
 │
+├── dev/
+│   └── test-hooks.ts               # window.__zotflowTest for live tests (off unless the profile sets a flag)
+│
 ├── bundle-assets/
 │   ├── inline-assets.ts            # Decompress reader resources → Blob URLs
 │   └── patch-inlined-assets.ts     # Rewrite viewer.html to use Blob URLs
@@ -263,14 +269,24 @@ src/
 ├── db/
 │   ├── db.ts                       # Dexie schema & getCombinations() helper (WORKER-ONLY)
 │   ├── normalize.ts                # Zotero API → IDB normalization (WORKER-ONLY)
-│   └── annotation.ts               # AnnotationJSON ↔ IDB conversion (WORKER-ONLY)
+│   ├── mutate.ts                   # mutateItem(s) / applyLocalEdit / newLocalItem / createLocalItems / deleteLocalItems (WORKER-ONLY)
+│   ├── annotation.ts               # AnnotationJSON ↔ IDB conversion (WORKER-ONLY)
+│   └── sync/                       # The sync model (docs/sync-architecture.md), WORKER-ONLY
+│       ├── reconcile.ts            # Port of Zotero's diff / applyChanges / patch / three-way merge (pure)
+│       ├── model.ts                # KeyState, derived syncStatus, subtree fingerprint (pure)
+│       ├── decide.ts               # Every sync decision as a pure function of (state, event)
+│       ├── commit.ts               # The one writer of sync state (SyncWriter, readKey, syncTransaction)
+│       └── migrate-v7.ts           # v6 → v7 migration plan (pure)
 │
 ├── services/
 │   ├── services.ts                 # ServiceLocator singleton (main thread)
 │   ├── index-service.ts            # Maps vault files by zotero-key frontmatter
 │   ├── log-service.ts              # In-memory log buffer (max 1000)
 │   ├── notification-service.ts     # Styled Obsidian Notice wrapper
-│   ├── task-monitor.ts             # Pub/sub for task progress updates
+│   ├── task-monitor.ts             # Task state store (replays the task list to subscribers)
+│   ├── event-hub.ts                # Data-change events (tree/note/annotation changed, note gone, sync finished)
+│   ├── pending-edits.ts            # Edits the main thread still holds back, flushed before a sync
+│   ├── csl-folder-service.ts       # Vault folder watcher feeding .csl/locale XML to the worker
 │   └── view-state-service.ts       # Reader view state persistence
 │
 ├── settings/
@@ -280,6 +296,7 @@ src/
 │       ├── general-section.ts      # Template paths, folders, toggles
 │       ├── sync-section.ts         # API key, library sync modes
 │       ├── cache-section.ts        # Cache toggle, limit, purge
+│       ├── csl-section.ts          # CSL renderer: default style/format, styles folder, cache
 │       └── webdav-section.ts       # WebDAV URL/user/password
 │
 ├── types/
@@ -287,6 +304,8 @@ src/
 │   ├── zotero-api-client.d.ts      # zotero-api-client ambient types
 │   ├── zotero-item.d.ts            # Auto-generated Zotero item types (from schema.json)
 │   ├── zotero-item-const.ts        # Zotero item type string array
+│   ├── zotero-base-fields.ts       # Auto-generated base-field map (e.g. case.title → caseName)
+│   ├── template-preview.ts         # Template tester results: preview (output/error/hints) and variable list
 │   ├── zotero.d.ts                 # ZoteroKey, ZoteroGroup, etc.
 │   ├── zotero-reader.d.ts          # Reader event types, AnnotationJSON
 │   ├── zotflow.d.ts                # TFileWithoutParentAndVault
@@ -313,18 +332,33 @@ src/
 │   ├── activity-center/
 │   │   ├── modal.tsx               # ActivityCenterModal (Obsidian Modal wrapper)
 │   │   ├── ZotFlowActivityCenter.tsx # Tab container component
-│   │   ├── SyncView.tsx            # Sync tab content (stub)
-│   │   └── TemplateTestView.tsx    # Template testing tab
+│   │   ├── SyncView.tsx            # Sync tab: libraries (↑ push / ↓ pull / conflict counts)
+│   │   ├── ConflictsView.tsx       # Conflicts tab: loads, resolves, moves to the next conflict
+│   │   ├── ConflictPanel.tsx       # Conflict list + resolver (why, Keep Local / Accept Remote with a per-field preview)
+│   │   ├── TemplateTestView.tsx    # Template tab: preview, errors, hints, save to settings/template file
+│   │   ├── TemplateVariablesPanel.tsx # Template tab: the picked item's variables (click to insert)
+│   │   ├── template-targets.ts     # Template tab: contexts and where each saves (pure)
+│   │   ├── template-store.ts       # Template tab: load the saved template, carry out a save
+│   │   ├── CslStylesView.tsx       # CSL tab: styles (aliases nested under parents) & locales
+│   │   └── CslRows.tsx             # CSL tab row components (status dot, badges, alias rows)
 │   └── modals/
 │       ├── suggest.ts              # BaseItemSearchModal + ZoteroSearchModal
 │       ├── item-picker.ts          # ItemPickerModal (extends BaseItemSearchModal)
-│       └── file-picker.ts          # FilePickerModal (local vault file picker)
+│       ├── file-picker.ts          # FilePickerModal (local vault file picker)
+│       ├── note-gone-modal.ts      # NoteGoneModal: text of a note deleted in Zotero → "Save as new note"
+│       ├── template-write-back-modal.ts # Confirms saving a tested template (setting or file)
+│       ├── csl-add-modal.ts        # AddCslStyleModal / AddCslLocaleModal (fetch-by-id preview + add)
+│       ├── csl-details-modal.ts    # StyleDetailsModal (state-aware actions for installed styles)
+│       └── csl-style-details.ts    # Shared StyleDetails block (meta table + deps + preview)
 │
 ├── worker/
 │   ├── worker.ts                   # Worker entry point — exposes WorkerAPI via Comlink
 │   ├── services/
 │   │   ├── zotero.ts               # ZoteroAPIService (zotero-api-client wrapper)
-│   │   ├── sync.ts                 # SyncService (bidirectional, conflict-aware)
+│   │   ├── sync.ts                 # SyncService (upload-then-download engine; decisions in db/sync/decide)
+│   │   ├── conflict.ts             # ConflictService (list by group, resolve; Keep Local / Accept Remote)
+│   │   ├── removed-items.ts        # Files that go with removed item rows (annotation PNGs)
+│   │   ├── edit-queue.ts           # EditQueue (debounced note/comment edits; flushed before a source-note render and a sync)
 │   │   ├── attachment.ts           # AttachmentService (download, cache, LRU prune)
 │   │   ├── webdav.ts               # WebDavService (file download, verify)
 │   │   ├── library-note.ts         # LibraryNoteService (library source note CRUD)
@@ -333,10 +367,18 @@ src/
 │   │   ├── library-template.ts     # LibraryTemplateService (LiquidJS for library items)
 │   │   ├── local-template.ts       # LocalTemplateService (LiquidJS for local files)
 │   │   ├── tree-view.ts            # TreeViewService (builds flattened topology)
-│   │   ├── pdf-processor.ts        # PDFProcessWorker (nested Worker for PDF.js)
+│   │   ├── display-title.ts        # DisplayTitleService (item title template for tree + search)
+│   │   ├── liquid-support.ts       # Shared Liquid helpers: preview results, error positions, frontmatter render
+│   │   ├── template-variables.ts   # Describes a template scope for the tester's variable list
+│   │   ├── document-worker.ts      # DocumentWorkerService (nested Zotero worker)
 │   │   ├── annotation.ts           # AnnotationService (reader annotation CRUD)
 │   │   ├── key.ts                  # KeyService (API key verify, library metadata)
-│   │   └── db-helper.ts            # DbHelperService (general-purpose DB queries)
+│   │   ├── csl-render.ts           # CslRenderWorkerService (CSL rendering; wraps worker/csl core)
+│   │   ├── search.ts               # SearchService (item search, recent items, autocomplete lists)
+│   │   ├── search-matcher.ts       # SearchMatcher (pure query parsing + fuzzy ranking; shared with tree view)
+│   │   └── db-helper.ts            # DbHelperService (general-purpose DB queries without a clearer owner)
+│   ├── csl/                        # Vendored csl-render core (citeproc wrapper; platform
+│   │                               #   agnostic, relative imports, WORKER-ONLY via services)
 │   └── tasks/
 │       ├── base.ts                 # BaseTask abstract (id, status, progress)
 │       ├── manager.ts              # TaskManager (register, start, cancel)
@@ -352,7 +394,8 @@ src/
     ├── error.ts                    # ZotFlowError class (codes, context, wrapping)
     ├── utils.ts                    # getNotePath() (sanitized filename)
     ├── file.ts                     # File CRUD helpers (read/write/check/delete)
-    └── credentials.ts              # Credential storage (Obsidian SecretStorage, not data.json)
+    ├── credentials.ts              # Credential storage (Obsidian SecretStorage, not data.json)
+    └── zotero-fields.ts            # getField(): Zotero base-field resolution for item data
 ```
 
 ---
@@ -366,12 +409,14 @@ src/
 | `dexie`               | IndexedDB wrapper                  | Worker                     |
 | `zotero-api-client`   | Zotero Web API                     | Worker (via proxied fetch) |
 | `liquidjs`            | Note template rendering            | Worker                     |
+| `citeproc`            | CSL citation/bibliography engine   | Worker                     |
 | `fflate`              | gzip decompression (reader assets) | Main                       |
 | `spark-md5`           | File integrity (attachment cache)  | Worker                     |
 | `p-limit`             | Concurrency control                | Worker                     |
 | `uuid`                | Task/entity ID generation          | Worker                     |
 | `react` + `react-dom` | Tree view, activity center UI      | Main                       |
 | `react-arborist`      | Virtual tree component             | Main                       |
+| `diff` (jsdiff)       | Word/line diffs in the conflict panel | Main                    |
 
 ---
 
@@ -387,8 +432,93 @@ npm run build:plugin   # Production build: tsc check + esbuild (plugin only)
 npm run build:reader   # Production build: webpack prod mode (reader only)
 npm run build        # Production build: reader + plugin
 npm run build:ci     # Full CI: build pdf.js + reader + plugin
-npm run lint         # eslint
+npm run test         # lint + typecheck:tests + the whole vitest suite
+npm run test:vitest  # vitest, one shot
+npm run test:watch   # vitest, watch mode
+npm run typecheck:tests   # tsc over tests/ (uses tests/tsconfig.json)
+npm run test:coverage     # vitest + v8 coverage (text + html)
+npm run lint         # eslint over the whole repo (still has a backlog)
+npm run generate-zotero-item-schema             # regenerate types from schema.json
+npm run generate-zotero-item-schema -- --fetch  # refresh schema.json from api.zotero.org first
 ```
+
+Read Zotero item fields through `getField()` (`utils/zotero-fields`), not
+`data.title` / `data.date` directly: several item types store base fields under
+their own names (a case's `title` is `caseName`, a book section's
+`publicationTitle` is `bookTitle`, a patent's `date` is `issueDate`).
+Template contexts get their bibliographic variables from `buildItemMetadata()`,
+which exposes every schema field (`ZOTERO_FIELDS`) — do not hand-list fields.
+
+`eslint .` runs as part of `npm test`. Keep the whole repository free of lint
+errors; remaining warnings should only represent explicit compatibility or UX
+decisions.
+
+### Tests
+
+Vitest, configured in `vitest.config.ts`. Everything lives under `tests/`:
+
+| Path                 | Contents                                                          |
+| -------------------- | ----------------------------------------------------------------- |
+| `tests/unit/`        | Pure functions and the convert pipeline                           |
+| `tests/integration/` | Worker services driven through fakes                              |
+| `tests/fakes/`       | `resetDb`, `createFakeParentHost`, `createFakeZoteroServer`       |
+| `tests/fixtures/`    | Real CSL styles/locales, cached in `tests/.csl-fixtures/`         |
+| `tests/stubs/`       | Inert `obsidian` module                                           |
+| `tests/setup.ts`     | fake-indexeddb, `navigator.onLine`, one IndexedDB spec workaround |
+
+Two things worth knowing before writing a service test:
+
+- **The `db` singleton is real.** `tests/setup.ts` installs `fake-indexeddb`, so
+  `db/db.ts` opens the actual Dexie schema — real compound indexes, real
+  version upgrades. Call `resetDb()` in `beforeEach`. Do not mock `db/db`.
+- **Zotero is faked at the HTTP layer**, not at `ZoteroAPIService`.
+  `createFakeZoteroServer().install()` replaces `globalThis.fetch`, which is
+  where `worker.ts` installs its proxied fetch in production. That keeps
+  `Last-Modified-Version` bookkeeping, 412 conflicts, `format=versions` deltas
+  and request chunking under test instead of mocked away.
+
+`tests/unit/obsidian-syntax.test.ts` is a discovery harness as well as a
+regression gate. Run it with `ZF_SYNTAX_MATRIX=1` to print the syntax survival
+matrix and the list of known gaps.
+
+Sync is tested in layers (docs/sync-architecture.md §8):
+
+- `tests/unit/reconcile.test.ts` — Zotero's own diff/patch/reconcile cases, ported.
+- `tests/unit/sync-decide.test.ts` — every abstract state × every event of
+  `db/sync/decide.ts`, then every event sequence up to `ZF_DECIDE_DEPTH`
+  (default 6; 10 verified) against a minimal one-object server. No DB.
+- `SyncService` integration files, split by what they hold still:
+  `sync-orchestration` (libraries, upload/download rounds, 412 and restart
+  limits, progress), `sync-pull`, `sync-push`, `sync-guards` (paths
+  `startSync` cannot reach, e.g. `upload` called directly), plus the scenario
+  files `sync-conflicts`, `sync-concurrency`, `sync-faults` and
+  `annotation-delete-conflict`. `createSyncHarness()` in
+  `tests/fakes/sync-harness.ts` wires all of it in one call (backoff sleeps
+  are instant there).
+- `tests/integration/sync-model.test.ts` — random sequences with faults;
+  replay a failure with `ZF_SYNC_MODEL_SEED=<n>`, widen with
+  `ZF_SYNC_MODEL_SEEDS=<count>` (5000 is the pre-merge run).
+- `tests/integration/sync-exhaustive.test.ts` + `tests/fakes/sync-world.ts`
+  — the acceptance checker: every action sequence up to
+  `ZF_EXHAUSTIVE_DEPTH` (2 in CI; 3 before merging, one
+  `ZF_EXHAUSTIVE_UNIVERSE` at a time), observing only services, row
+  statuses and the conflict list. `ZF_EXHAUSTIVE_REPORT=1` lists every kind
+  of violation with its shortest path; `ZF_EXHAUSTIVE_PROGRESS=1` prints
+  progress. Depth 3 takes one to a few minutes per universe — if it crawls,
+  check that the process is not niced (zsh's `BG_NICE` lowers background
+  jobs, and macOS then runs them on efficiency cores), and keep
+  `pruneFinishedTransactions()` in the world: fake-indexeddb otherwise
+  rescans every transaction it ever ran.
+
+Run a wide search (model seeds, checker depth 3) after touching sync, and
+keep the fake server (`tests/fakes/zotero-server.ts`) as strict as the real
+API. A "no violation" result means something only together with a mutation
+check: break the rule on purpose and watch a test fail.
+
+Coverage is a map of what is untested, not a gate — there is no threshold, and
+a green number proves only that a line ran. When a sync branch matters, confirm
+the test actually binds it by breaking the branch on purpose and watching the
+expected test fail.
 
 ### esbuild Custom Plugins
 
@@ -422,7 +552,6 @@ The `reader/reader` directory is **excluded** from TypeScript compilation. Do no
 - Use `for...of` for async iteration, **never** `Array.forEach` with async callbacks.
 - Use `ReturnType<typeof setTimeout>` for timer IDs, never `NodeJS.Timeout` (this runs in a browser/Worker, not Node).
 - Prefer specific types over `any`. If `any` is unavoidable, add a `// TODO: type this` comment.
-- Limit files to ~300 lines. Extract when growing beyond.
 
 ### 6.2 Import style
 
@@ -563,6 +692,11 @@ const response = await fetch(url, { ... }); // transparently proxied
 2. Implement it in `ParentHost` in `bridge/parent-host.ts`
 3. Call it via `this.parentHost.methodName()` in Worker code
 
+Data-change notifications are the exception: the worker raises EventHub events
+with `this.parentHost.emit("treeChanged")` (typed by `EventArgs`). A new one
+needs its bus on `EventHub` and its name in `WorkerEventName`
+(`services/event-hub.ts`), not a new `IParentProxy` method.
+
 ---
 
 ## 9. Database (Dexie/IndexedDB) — Worker-Only
@@ -590,22 +724,84 @@ via the Comlink `WorkerBridge`.
 | `QueryService`      | `view.ts` (attachment lookup)      | `getAttachmentItem` (extensible for future `getItem`, etc.)            |
 | `AttachmentService` | `cache-section.ts`                 | `getCacheTotalSizeBytes`, `purgeCache`                                 |
 
-### Schema (version 1)
+### Schema (current version: 7)
 
-| Table         | Key         | Indexes                                                                                                    |
-| ------------- | ----------- | ---------------------------------------------------------------------------------------------------------- |
-| `keys`        | `key`       | —                                                                                                          |
-| `groups`      | `id`        | —                                                                                                          |
-| `items`       | `++localID` | `[libraryID+key]`, `[libraryID+parentItem+itemType+trashed]`, `[libraryID+itemType+trashed]`, `syncStatus` |
-| `collections` | `++localID` | `[libraryID+key]`, `[libraryID+parentCollection]`, `libraryID`                                             |
-| `libraries`   | `id`        | —                                                                                                          |
-| `files`       | `++localID` | `[libraryID+key]`, `lastAccessed`                                                                          |
+Primary keys are the `&`-prefixed declarations in `db/db.ts`, and the `Table<T, K>`
+type parameters mirror them. **There is no `localID` column** — `items`,
+`collections`, `files` and the sync tables are keyed by the compound
+`[libraryID+key]`, which is why `db.items.get([libraryID, key])` is the
+correct way to address a row.
+
+| Table           | Primary key        | Secondary indexes                                                                                                                                                                       |
+| --------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `keys`          | `&key`             | —                                                                                                                                                                                       |
+| `groups`        | `&id`              | —                                                                                                                                                                                       |
+| `libraries`     | `&id`              | — (`itemVersion` is the download cursor; `needsFullSync`)                                                                                                                               |
+| `items`         | `&[libraryID+key]` | `[libraryID+syncStatus]`, `[libraryID+itemType+trashed]`, `[libraryID+parentItem+itemType+trashed]`, `*collections`, `*searchCreators`, `*searchTags`, `dateModified`, `lastAccessedAt` |
+| `collections`   | `&[libraryID+key]` | `[libraryID+trashed]`, `[libraryID+syncStatus]`, `[libraryID+parentCollection]`                                                                                                         |
+| `files`         | `&[libraryID+key]` | `md5`, `lastAccessedAt`                                                                                                                                                                 |
+| `cslCache`      | `&key`             | — (string KV cache for CSL styles/locales/index)                                                                                                                                        |
+| `syncCache`     | `&[libraryID+key]` | — merge base of an unsynced row (the server copy its local changes started from)                                                                                                       |
+| `syncDeleteLog` | `&[libraryID+key]` | — local deletes not yet uploaded (the row is already gone; `snapshot` restores it)                                                                                                      |
+| `syncConflicts` | `&[libraryID+key]` | `[libraryID+group]` — `kind`: `changed` / `local-deleted` / `remote-deleted` / `refused` (`orphan`: its parent exists nowhere)                                                         |
+| `syncGroups`    | `&[libraryID+id]`  | — one remote deletion with local changes under it: its recorded members                                                                                                                 |
+| `syncQueue`     | `&[libraryID+key]` | `[libraryID+lastCheck]` — objects to retry with backoff                                                                                                                                 |
+| `uploadJournal` | `&[libraryID+key]` | — writes sent whose outcome is unknown (a copy of what was sent)                                                                                                                        |
+
+Item sync columns: `version` (last known server version, 0 = not created
+yet), `synced` (0/1), `localOnly`, `localRevision` (bumped by every local
+write), and `syncStatus` — **derived** (`synced` / `created` / `updated` /
+`conflict` / `ignore`) by `commit.ts`, never written elsewhere.
+
+Source notes record what they were rendered from in frontmatter, because the
+vault syncs between devices and the database does not: `item-version`,
+`item-tree` (the subtree fingerprint, `itemTreeFingerprint()` — computed when a
+note is checked or rendered, never stored) and `library-version` (the
+library's sync cursor at render time). A note whose `library-version` is ahead
+of this device's cursor was rendered from a newer copy of the library and is
+left alone until this device catches up (unless the update is forced).
+
+Version history: v1 base schema · v2 adds `[libraryID+parentCollection]` to
+`collections` · v3 adds `lastAccessedAt` to `items` · v4 clears `files` (cached
+bytes moved from `Blob` to `ArrayBuffer`) · v5 adds `cslCache` · v6 backfills
+base-mapped titles (`case.caseName`, `statute.nameOfAct`, `email.subject`) ·
+v7 the sync model (`db/sync/migrate-v7.ts` maps every v6 `syncStatus`).
+
+`*`-prefixed entries are Dexie multi-valued indexes.
 
 ### Rules
 
 - Always use `.where()` with compound indexes for queries (not `.filter()`).
 - Use `getCombinations()` from `db/db.ts` for Cartesian product queries on compound indexes.
 - Use Dexie transactions (`db.transaction('rw', ...)`) for multi-table writes.
+- Local writes of Zotero item data go through `db/mutate.ts`, never a
+  hand-written `db.items.update`/`put`: `mutateItem()` / `mutateItems()` for
+  edits, `createLocalItems()` for rows built by `newLocalItem()`,
+  `deleteLocalItems()` for deletes (notes go to the trash — an edit of
+  `deleted`; everything else is hard-deleted into the delete log). An edit
+  may not change `key`, `itemType` or `version`; it marks the row unsynced,
+  bumps `localRevision`, keeps the server copy as merge base on the first
+  edit, and a row created or edited under a remote-deleted item joins that
+  deletion's group. A row in conflict stays in conflict. `mutateItem`
+  returning `undefined` means the item is gone (e.g. deleted in Zotero by a
+  sync meanwhile): callers must say so, never drop the edit silently
+  (`ItemNoteService.updateNoteContent` returns `{ status: "gone" }`).
+- Sync state is written only by `db/sync/commit.ts` (`SyncWriter`), from
+  states produced by the pure functions in `db/sync/decide.ts`. ESLint
+  rejects `syncStatus` / `synced` / `localRevision` / `localOnly` writes,
+  item `version` updates and any write to the sync tables outside
+  `db/sync/**`, `db/mutate.ts`, `db/normalize.ts` and `db/db.ts`.
+  Bookkeeping columns (`lastAccessedAt`, `csljson`, view state, image
+  versions) are not sync state.
+- Every read-decide-write is one Dexie transaction over `syncTables()`
+  (`syncTransaction`), awaiting only Dexie inside; network requests are
+  always outside. Snapshots stored anywhere are copies (`structuredClone`).
+- Decide from recorded facts only — never infer history from the current
+  parent/child structure. A conflict is ended only by the user (or when both
+  sides came to hold the same thing).
+- The download cursor moves only after a complete download at one library
+  version, or along the precondition chain of our own writes. No version
+  arithmetic.
 - When adding new indexes or tables, bump the Dexie version number and add a migration.
 - **Never import `db/` modules from main-thread code.** If the main thread needs data from IDB, add a method to an existing worker service (or create a new one) and call it via `workerBridge`.
 
@@ -676,19 +872,123 @@ npm run lint                 # ESLint
 Manual install: copy `main.js`, `manifest.json`, `styles.css` to:
 
 ```
-<Vault>/.obsidian/plugins/obsidian-zotflow/
+<Vault>/.obsidian/plugins/zotflow/
 ```
 
-Reload Obsidian → **Settings → Community plugins** → enable.
+The folder must match the manifest `id` (`zotflow`), not the npm package name
+(`obsidian-zotflow`). Reload Obsidian → **Settings → Community plugins** → enable.
+
+Live checks run in an isolated Obsidian driven over CDP (setup steps and
+options in README, "Live testing in Obsidian"):
+
+```bash
+npm run live:obsidian -- setup     # once: vault, hard-linked plugin, Hot Reload, config
+npm run live:obsidian -- launch    # own --user-data-dir, CDP on 9223
+npm run live:obsidian -- login     # needs ZOTFLOW_TEST_API_KEY
+npm run live:obsidian -- dev       # esbuild watch; Hot Reload reloads on each rebuild
+npm run live:obsidian -- reload    # manual reload (e.g. after npm run build:plugin)
+npm run live:obsidian -- eval '<js>' | screenshot [out] [window] | logs [s] | targets | quit | reset
+npm run live:memory                # memory samples from the same instance
+npm run live:fixtures -- plan | apply | purge --yes | keys [id...] | libraries
+npm run live:app                   # Playwright UI tests (tests/live/app)
+```
+
+`npm run live:fixtures` seeds the test library (`fixtureLibrary` in
+`.obsidian-test/config.json`) from `scripts/fixture-library.mjs` and resets it
+after a test changes it; run `apply` before a live test that depends on known
+data. It only touches objects it owns — never add a write path that skips
+`ownedSets()`. Keys are `fixtureKey(id)` ("ZFX…"), so address fixture items by
+id, not by searching. Attachment files are generated (`makePdf`, `makeEpub`,
+`makeHtml`); PDF text is Helvetica ASCII, and `annotate.*` places annotations
+on it. New spec objects need permanent ids: changing an id recreates the
+object under a new key.
+
+`npm run live:sync [-- pull push conflicts faults concurrency upgrade]` runs the live
+sync tests in `tests/live/sync/`, one file per kind of sync: real plugin
+services in the test Obsidian, the real test group, another client simulated
+through the API, and faults injected by holding a worker request (pass, drop
+its answer after the server applied it, or fail it unsent). Every test resets
+both sides first (fixtures `apply`, local library cleared and fully synced).
+They reach the page through one Playwright connection per test file
+(`session()` in `tests/live/sync/lib.mjs`, closed by an `after` hook) and the
+worker through `window.__zotflowTest`
+(`src/dev/test-hooks.ts`), which exists only when the vault's localStorage
+holds `zotflow-test-hooks = "1"` — set by the tests in the isolated profile,
+never by the plugin. Rebuild and reload the plugin before running, and not during a run:
+hot-reload restarts the plugin, and a call into it then fails with "ZotFlow
+was reloaded during this call" (every call into the page also has a
+`ZF_LIVE_CALL_TIMEOUT_S` limit, 600 by default). Results:
+`.obsidian-test/live-sync/` (JUnit XML, and `facts.jsonl` with the server
+behaviour each test observed). Put a new live sync test in the file for its
+kind; record server behaviour it depends on with `fact()`.
+
+`upgrade` is the v6 → v7 upgrade end to end: it deletes the local database,
+runs the released 1.6.6 `main.js` (downloaded once to
+`.obsidian-test/releases/`) and has it build every old sync state with its
+own services, then opens that database with the current build and syncs.
+The release has no test hooks, so its worker is driven with raw Comlink
+`APPLY` messages (`v6()` in that file). It puts the current build, hot-reload
+and a clean library back when it ends.
+
+`ZF_LIVE_TARGET=ios npm run live:sync` runs the same sync tests against
+Obsidian on an iPad or iPhone, because iOS has its own network layer:
+`requestUrl` there goes through Capacitor's native HTTP, which silently drops
+non-string header values (that once stripped `If-Unmodified-Since-Version`
+from every upload). `tests/live/sync/webkit-session.mjs` replaces the
+Playwright page with the WebKit Inspector Protocol through
+`ios_webkit_debug_proxy` (`brew install ios-webkit-debug-proxy`, then
+`ios_webkit_debug_proxy -c <udid>:9222`; `idevice_id -l` lists the udid,
+`ZF_IOS_PROXY` overrides the address). The device needs Settings → Safari →
+Advanced → Web Inspector, Obsidian in the foreground and unlocked, the plugin
+with the test hooks flag set in that vault, and no other inspector on the
+page: the device gives a page to one inspector at a time, so close Safari's
+Web Inspector and do not poll the page from a second connection during a
+run. It provides only `evaluate` and `waitForFunction`, so `source-notes`
+(Playwright locators) is skipped, and so is `upgrade` (it deletes the whole
+database, which on a device is the user's own). The tests reset only the
+fixture library. Copy the build into the device vault's
+`.obsidian/plugins/zotflow/` before running.
+
+`npm run live:app` runs the live UI tests in `tests/live/app/` with
+Playwright (`playwright-core`, no bundled browser) attached to the running
+test Obsidian over CDP: `Harness#playwright()` → `{ page, disconnect }`
+(`disconnect()` leaves Obsidian running). Tests share the sync helpers'
+`session()` rather than connecting themselves, and get `reset()`/`local`
+from there too. Use it for anything that needs real
+input or waiting: trusted clicks, keyboard into CM6, mouse drags inside the
+reader's nested iframes (`openReader()` returns the reader frame, the
+document frame and the sidebar cards), and auto-waiting locators instead of
+sleeps. Find a new annotation by diffing sidebar ids, never by card index —
+the sidebar is sorted by position. `openView()` always uses a fresh leaf so
+each test starts from a newly opened view; leaf reuse has its own tests. Do
+not launch Obsidian through Playwright's Electron
+launcher; it bypasses the isolated profile.
+
+Prefer `eval` over screenshots: `app.commands.executeCommandById("zotflow:…")`,
+`app.plugins.plugins.zotflow`, and DOM queries return structured results. The
+worker shares the main window's origin, so its Dexie database (`zotflow-dev`)
+can be read with `indexedDB.open` from `eval`. Settings opens in its own window
+in Obsidian 1.13+; pass `Settings` as the screenshot window. The Zotero key is
+the developer's own and must never be committed or echoed.
 
 ---
 
 ## 13. Versioning & Releases
 
-- Bump `version` in `manifest.json` (SemVer, no leading `v`).
-- Update `versions.json` to map new version → minimum Obsidian version.
-- Create GitHub release with tag matching `manifest.json` version exactly.
-- Attach `manifest.json`, `main.js`, `styles.css` as release assets.
+- `dev` is the only long-lived development branch; `master` contains only
+  versions that have already been published as stable releases.
+- Create beta releases from a clean, synchronized `dev` with
+  `npm run beta -- patch|minor|major`. This creates and pushes an annotated
+  `x.y.z-beta.N` tag without changing or committing version files.
+- The beta tag workflow temporarily updates release metadata in its runner and
+  publishes a non-draft prerelease. Never move or reuse a published beta tag.
+- Create stable versions on `dev` with `npm version patch|minor|major`, which
+  updates `manifest.json`, `versions.json`, and the package lock through the
+  existing version hook and creates the stable tag.
+- Inspect and publish the stable Draft Release before merging the exact stable
+  tag into `master`; do not merge a later moving `dev` head.
+- Every Release tag must match the released `manifest.json` version exactly and
+  include `manifest.json`, `main.js`, and `styles.css` as assets.
 
 ---
 

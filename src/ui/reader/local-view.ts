@@ -1,4 +1,4 @@
-import { FileView, WorkspaceLeaf, TFile, ItemView } from "obsidian";
+import { WorkspaceLeaf, TFile, ItemView } from "obsidian";
 import { workerBridge } from "bridge";
 import { IframeReaderBridge } from "./bridge";
 import { LocalDataManager } from "./local-data-manager";
@@ -12,14 +12,35 @@ import type {
     ColorScheme,
     AnnotationJSON,
     CustomReaderTheme,
+    ReaderNavigation,
 } from "types/zotero-reader";
+import type { ViewStateResult } from "obsidian";
 import type { TagInput } from "worker/services/tag";
+import type { ReaderDocumentLease } from "services/reader-document-cache";
 import { services } from "services/services";
+import {
+    getLocalReaderDocumentFormat,
+    getLocalReaderDocumentKey,
+} from "services/reader-document-cache";
+import { errorMessage as describeError } from "utils/error";
+import { fireAndForgetIn } from "utils/fire-and-forget";
+import { redirectDuplicateReaderLeaf } from "utils/reader-leaf-navigation";
 
 /** View type identifier for the local vault file reader view. */
 export const LOCAL_ZOTERO_READER_VIEW_TYPE = "zotflow-local-zotero-reader-view";
 
+/** Persisted view state: the vault path of the file being read. */
+interface LocalReaderViewState extends Record<string, unknown> {
+    file?: string;
+}
+
 /** Obsidian `ItemView` that embeds the Zotero reader iframe for local PDF/EPUB/HTML vault files. */
+const ff = fireAndForgetIn("LocalReaderView");
+
+/** In-flight setState calls, keyed by vault path, to close a race between two
+ * concurrent opens of the same local file. */
+const openingLocalReaders = new Map<string, WorkspaceLeaf>();
+
 export class LocalReaderView extends ItemView {
     private file: TFile | null = null;
     private bridge?: IframeReaderBridge;
@@ -27,6 +48,10 @@ export class LocalReaderView extends ItemView {
     private readerOptions: Partial<CreateReaderOptions> = {};
     private dataManager?: LocalDataManager;
     private knownAnnotationIds = new Set<string>();
+    private unsubscribeLocalAnnotationChanged?: () => void;
+    private documentLease?: ReaderDocumentLease;
+    private closing = false;
+    private localReaderState: LocalReaderViewState = {};
 
     constructor(leaf: WorkspaceLeaf) {
         super(leaf);
@@ -94,25 +119,77 @@ export class LocalReaderView extends ItemView {
 
     async onOpen() {}
 
-    async setState(state: any, result: any) {
-        if (state.file) {
-            const file = services.app.vault.getAbstractFileByPath(state.file);
-            if (file instanceof TFile) {
-                this.file = file;
-                this.containerEl
-                    .getElementsByClassName("view-header-title")[0]
-                    ?.setText(this.file.name);
+    async setState(state: LocalReaderViewState, result: ViewStateResult) {
+        this.localReaderState = state;
 
-                this.loadDocument(this.file);
+        // Single-instance guard: reveal an existing reader for this file and
+        // close the duplicate leaf before loading the document again.
+        if (state.file) {
+            const existing = this.findExistingLocalReaderLeaf(state.file);
+            if (existing && existing !== this.leaf) {
+                services.logService.warn(
+                    `Local attachment ${state.file} is already open; reusing existing reader leaf`,
+                    "LocalReaderView",
+                );
+                services.notificationService.notify(
+                    "warning",
+                    "This file is already open. Use the reader's built-in split view to open two views of the same file.",
+                );
+                ff(
+                    redirectDuplicateReaderLeaf(
+                        this.app.workspace,
+                        this.leaf,
+                        existing,
+                    ),
+                    "Failed to redirect a duplicate reader leaf",
+                );
+                return;
             }
+
+            openingLocalReaders.set(state.file, this.leaf);
+            try {
+                const file = services.app.vault.getAbstractFileByPath(
+                    state.file,
+                );
+                if (file instanceof TFile) {
+                    this.file = file;
+                    this.containerEl
+                        .getElementsByClassName("view-header-title")[0]
+                        ?.setText(this.file.name);
+
+                    ff(this.loadDocument(this.file), "Failed to load document");
+                }
+                await super.setState(state, result);
+            } finally {
+                if (openingLocalReaders.get(state.file) === this.leaf) {
+                    openingLocalReaders.delete(state.file);
+                }
+            }
+            return;
         }
-        super.setState(state, result);
+        return super.setState(state, result);
     }
 
-    getState(): any {
-        return {
-            file: this.file?.path,
-        };
+    /** Find another leaf already showing, or currently opening, this file. */
+    private findExistingLocalReaderLeaf(path: string): WorkspaceLeaf | null {
+        for (const leaf of this.app.workspace.getLeavesOfType(
+            LOCAL_ZOTERO_READER_VIEW_TYPE,
+        )) {
+            if (leaf === this.leaf) continue;
+            const leafState = leaf.getViewState().state as
+                | Partial<LocalReaderViewState>
+                | null
+                | undefined;
+            if (leafState?.file === path) {
+                return leaf;
+            }
+        }
+
+        return openingLocalReaders.get(path) ?? null;
+    }
+
+    getState(): LocalReaderViewState {
+        return this.localReaderState;
     }
 
     private async loadDocument(file: TFile) {
@@ -123,7 +200,7 @@ export class LocalReaderView extends ItemView {
         loadingEl.setText(`Loading ${file.name}...`);
 
         try {
-            this.renderReader(file);
+            ff(this.renderReader(file), "Failed to render the reader");
         } catch (e) {
             services.logService.error(
                 "Error loading document",
@@ -139,23 +216,30 @@ export class LocalReaderView extends ItemView {
 
     private async renderReader(file: TFile) {
         const container = this.contentEl;
-
-        // Resolve initial color scheme based on setting
-        const schemeSetting = services.settings.readerColorScheme;
-        if (schemeSetting === "light") {
-            this.colorScheme = "light";
-        } else if (schemeSetting === "dark") {
-            this.colorScheme = "dark";
-        } else {
-            this.colorScheme = getComputedStyle(document.body)
-                .colorScheme as ColorScheme;
-        }
+        let acquiredLease: ReaderDocumentLease | undefined;
+        let leaseInstalled = false;
+        let readerInitialized = false;
 
         try {
+            const format = getLocalReaderDocumentFormat(file.extension);
+            const documentKey = getLocalReaderDocumentKey(file);
+
+            // Resolve initial color scheme based on setting
+            const schemeSetting = services.settings.readerColorScheme;
+            if (schemeSetting === "light") {
+                this.colorScheme = "light";
+            } else if (schemeSetting === "dark") {
+                this.colorScheme = "dark";
+            } else {
+                this.colorScheme = getComputedStyle(document.body)
+                    .colorScheme as ColorScheme;
+            }
+
             // Create bridge once
             if (!this.bridge) {
                 // Initialize data manager
                 this.dataManager = new LocalDataManager(file);
+                this.subscribeToLocalAnnotationChanges(file);
                 this.bridge = new IframeReaderBridge(
                     container,
                     true,
@@ -166,27 +250,44 @@ export class LocalReaderView extends ItemView {
 
                 // Register event listeners
                 this.bridge.onEventType("error", (evt) => {
-                    console.error(`${evt.code}: ${evt.message}`);
+                    services.logService.error(
+                        `Reader error ${evt.code}: ${evt.message}`,
+                        "LocalReaderView",
+                    );
                 });
 
+                // Sidebar geometry is not persisted yet — see the twin in
+                // `view.ts`. Kept as debug traces so the hook stays visible.
                 this.bridge.onEventType("sidebarToggled", (evt) => {
-                    console.log("Sidebar toggled:", evt.open);
+                    services.logService.debug(
+                        `Sidebar toggled: ${evt.open}`,
+                        "LocalReaderView",
+                    );
                 });
 
                 this.bridge.onEventType("sidebarWidthChanged", (evt) => {
-                    console.log("Sidebar width changed:", evt.width);
+                    services.logService.debug(
+                        `Sidebar width changed: ${evt.width}`,
+                        "LocalReaderView",
+                    );
                 });
 
                 this.bridge.onEventType("openLink", (evt) => {
                     this.handleOpenLink(evt.url);
                 });
 
-                this.bridge.onEventType("annotationsSaved", async (evt) => {
-                    await this.handleAnnotationsSaved(evt.annotations);
+                this.bridge.onEventType("annotationsSaved", (evt) => {
+                    ff(
+                        this.handleAnnotationsSaved(evt.annotations),
+                        "Failed to apply saved annotations",
+                    );
                 });
 
-                this.bridge.onEventType("annotationsDeleted", async (evt) => {
-                    await this.handleAnnotationsDeleted(evt.ids);
+                this.bridge.onEventType("annotationsDeleted", (evt) => {
+                    ff(
+                        this.handleAnnotationsDeleted(evt.ids),
+                        "Failed to apply deleted annotations",
+                    );
                 });
 
                 this.bridge.onEventType("openTagsPopup", (evt) => {
@@ -227,7 +328,10 @@ export class LocalReaderView extends ItemView {
                                 newColorScheme &&
                                 newColorScheme !== this.colorScheme
                             ) {
-                                this.bridge!.setColorScheme(newColorScheme);
+                                ff(
+                                    this.bridge!.setColorScheme(newColorScheme),
+                                    "Failed to set the reader colour scheme",
+                                );
                                 this.colorScheme = newColorScheme;
                             }
                         }
@@ -235,22 +339,54 @@ export class LocalReaderView extends ItemView {
                 );
             }
 
-            // Connect Bridge & Get File concurrently
-            const [_, buffer, loadedAnnotations] = await Promise.all([
-                this.bridge.connect(),
-                this.app.vault.readBinary(file),
-                (async () => {
-                    return await this.dataManager?.loadAnnotations();
-                })(),
-            ]);
-
-            // Seed known-annotation set so the initial load isn't auto-copied.
-            this.knownAnnotationIds = new Set(
-                (loadedAnnotations ?? []).map((a: AnnotationJSON) => a.id),
+            // Connect, load annotations, and acquire the shared document in
+            // parallel. The cache de-duplicates concurrent reads of this file.
+            const leasePromise = services.readerDocumentCache.acquire(
+                documentKey,
+                async () => {
+                    const buffer = await this.app.vault.readBinary(file);
+                    return {
+                        blob: new Blob([buffer], { type: format.mimeType }),
+                    };
+                },
             );
+            try {
+                const [, lease, loadedAnnotations] = await Promise.all([
+                    this.bridge.connect(),
+                    leasePromise,
+                    (async () => {
+                        return await this.dataManager?.loadAnnotations();
+                    })(),
+                ]);
+                acquiredLease = lease;
 
-            // Initialize Reader if ready
-            if (this.bridge.state === "bridge-ready") {
+                if (this.closing) {
+                    acquiredLease.release();
+                    acquiredLease = undefined;
+                    return;
+                }
+
+                // Seed known-annotation set so the initial load isn't auto-copied.
+                this.knownAnnotationIds = new Set(
+                    (loadedAnnotations ?? []).map(
+                        (a: AnnotationJSON) => a.id,
+                    ),
+                );
+
+                // Another overlapping render may already own the View's lease.
+                if (
+                    this.bridge.state !== "bridge-ready" ||
+                    this.documentLease
+                ) {
+                    acquiredLease.release();
+                    acquiredLease = undefined;
+                    return;
+                }
+
+                this.documentLease = acquiredLease;
+                acquiredLease = undefined;
+                leaseInstalled = true;
+
                 // Read persisted view state (including saved themes)
                 const viewState = services.viewStateService.getViewState(
                     file.path,
@@ -265,7 +401,8 @@ export class LocalReaderView extends ItemView {
                 const themeOverrides = {
                     lightTheme:
                         viewState?.lightTheme ?? themeDefaults.lightTheme,
-                    darkTheme: viewState?.darkTheme ?? themeDefaults.darkTheme,
+                    darkTheme:
+                        viewState?.darkTheme ?? themeDefaults.darkTheme,
                 };
 
                 const autoDisable =
@@ -283,48 +420,47 @@ export class LocalReaderView extends ItemView {
                     ...themeOverrides,
                 };
 
-                const type = this.getReaderType(file.extension);
-
-                // Initialize Reader Logic
-                this.bridge.initReader({
-                    data: {
-                        buf: new Uint8Array(buffer),
-                        url: null,
-                    },
-                    type: type as any,
+                await this.bridge.initReader({
+                    data: { buf: null, url: this.documentLease.url },
+                    type: format.readerType,
                     authorName: "",
                     ...opts,
                 });
+                readerInitialized = true;
+            } catch (e) {
+                // If another Promise rejected first, release the lease when its
+                // in-flight load eventually settles.
+                void leasePromise
+                    .then((lease) => lease.release())
+                    .catch(() => undefined);
+                throw e;
             }
-        } catch (e: any) {
-            console.error("Error loading Zotero Reader view:", e);
+        } catch (e) {
+            acquiredLease?.release();
+            if (leaseInstalled && !readerInitialized) {
+                this.releaseDocumentLease();
+            }
+            if (this.closing) return;
+            services.logService.error(
+                "Error loading Zotero Reader view",
+                "LocalReaderView",
+                e,
+            );
             container.empty();
             const errorMessage = container.createDiv({
                 cls: "error-message",
             });
+            errorMessage.createDiv().setText("Failed to load Zotero Reader");
             errorMessage
-                .createEl("div")
-                .setText("Failed to load Zotero Reader");
-            errorMessage.createEl("div").setText("Error details: " + e.message);
+                .createDiv()
+                .setText("Error details: " + describeError(e));
         }
     }
 
-    private getReaderType(extension: string) {
-        switch (extension.toLowerCase()) {
-            case "pdf":
-                return "pdf";
-            case "epub":
-                return "epub";
-            case "html":
-                return "snapshot";
-            default:
-                return "pdf";
-        }
-    }
     // Handle navigation info
-    setEphemeralState(state: any): void {
-        if (state && state.subpath) {
-            const subpath = state.subpath;
+    setEphemeralState(state: unknown): void {
+        const subpath = (state as { subpath?: unknown } | null)?.subpath;
+        if (typeof subpath === "string") {
             const navigationInfo = this.parseNavigationInfo(subpath);
 
             if (navigationInfo) {
@@ -336,27 +472,78 @@ export class LocalReaderView extends ItemView {
     }
 
     // Parse navigation info
-    parseNavigationInfo(subpath: string): any {
+    parseNavigationInfo(subpath: string): ReaderNavigation | null {
         //Regex to match annotation=url_encoded_string
         const match = subpath.match(/annotation=([^&]+)/);
         if (match && match[1]) {
-            return JSON.parse(decodeURIComponent(match[1]));
+            return JSON.parse(decodeURIComponent(match[1])) as ReaderNavigation;
         }
         return null;
     }
 
-    readerNavigate(navigationInfo: any) {
+    readerNavigate(navigationInfo: ReaderNavigation) {
         if (!this.bridge) return;
-        this.bridge.navigate(navigationInfo);
+        ff(
+            this.bridge.navigate(navigationInfo),
+            "Failed to navigate the reader",
+        );
     }
 
     async onClose() {
-        if (this.bridge) {
-            await this.bridge.dispose();
+        this.closing = true;
+        this.unsubscribeLocalAnnotationChanged?.();
+        this.unsubscribeLocalAnnotationChanged = undefined;
+
+        try {
+            if (this.bridge) {
+                await this.bridge.dispose();
+            }
+        } finally {
+            this.bridge = undefined;
+            this.releaseDocumentLease();
         }
+
+        this.dataManager = undefined;
+        this.file = null;
+        this.knownAnnotationIds.clear();
 
         // Flush view state on close to ensure latest state is saved
         services.viewStateService.flushViewStateSave();
+    }
+
+    private releaseDocumentLease(): void {
+        this.documentLease?.release();
+        this.documentLease = undefined;
+    }
+
+    /**
+     * Subscribe to comment edits made from the source note's ANNO editable
+     * regions so an open reader reloads the sidecar instead of clobbering
+     * the edit with its stale in-memory cache.
+     */
+    private subscribeToLocalAnnotationChanges(file: TFile) {
+        this.unsubscribeLocalAnnotationChanged?.();
+
+        this.unsubscribeLocalAnnotationChanged =
+            services.eventHub.localAnnotationChanged.subscribe(
+                (attachmentPath) => {
+                    if (attachmentPath !== file.path) return;
+                    if (!this.dataManager) return;
+
+                    this.dataManager
+                        .loadAnnotations()
+                        .then((annotations) =>
+                            this.bridge?.refreshAnnotations(annotations),
+                        )
+                        .catch((e) => {
+                            services.logService.error(
+                                "Failed to refresh local reader annotations after markdown edit",
+                                "LocalReaderView",
+                                e,
+                            );
+                        });
+                },
+            );
     }
 
     /**
@@ -368,6 +555,13 @@ export class LocalReaderView extends ItemView {
             this.file.path,
             primary,
             state as Record<string, unknown>,
+        );
+
+        // Keep the bridge's replay cache current — see the twin in `view.ts`.
+        this.bridge?.updateReaderOpts(
+            primary
+                ? { primaryViewState: state as Record<string, unknown> }
+                : { secondaryViewState: state as Record<string, unknown> },
         );
     }
 
@@ -382,7 +576,7 @@ export class LocalReaderView extends ItemView {
     /**
      * Handle saved/updated annotations
      */
-    private async handleAnnotationsSaved(annotations: any[]) {
+    private async handleAnnotationsSaved(annotations: AnnotationJSON[]) {
         if (this.dataManager) {
             for (const annotation of annotations) {
                 const isVisual =
@@ -409,16 +603,12 @@ export class LocalReaderView extends ItemView {
                 this.file,
             )?.path;
             for (const annotation of annotations) {
-                const id = (annotation as AnnotationJSON).id;
+                const id = annotation.id;
                 if (this.knownAnnotationIds.has(id)) continue;
                 this.knownAnnotationIds.add(id);
-                await copyAnnotationOnCreate(annotation as AnnotationJSON, {
+                await copyAnnotationOnCreate(annotation, {
                     sourceNotePath,
                 });
-            }
-            // Make sure re-saved (existing) annotation IDs are also tracked.
-            for (const annotation of annotations) {
-                this.knownAnnotationIds.add((annotation as AnnotationJSON).id);
             }
         }
     }

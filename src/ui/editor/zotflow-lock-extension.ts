@@ -11,6 +11,8 @@ interface FrontmatterInfo {
     fmEnd: number;
     hasLibraryId: boolean;
     libraryId: number | undefined;
+    /** True for local attachment source notes (zotflow-local-attachment). */
+    isLocal: boolean;
 }
 
 /** Parse frontmatter once, extracting lock state, end offset, and library-id. */
@@ -21,6 +23,7 @@ function parseFrontmatter(state: EditorState): FrontmatterInfo {
             fmEnd: -1,
             hasLibraryId: false,
             libraryId: undefined,
+            isLocal: false,
         };
     }
 
@@ -36,12 +39,14 @@ function parseFrontmatter(state: EditorState): FrontmatterInfo {
     const fm = fmMatch ? fmMatch[0] : "";
     const libIdMatch = /^library-id:\s*(\d+)/m.exec(fm);
     const libraryId = libIdMatch ? Number(libIdMatch[1]) : undefined;
+    const isLocal = /^zotflow-local-attachment:/m.test(fm);
 
     return {
         locked,
         fmEnd,
         hasLibraryId: libraryId !== undefined,
         libraryId,
+        isLocal,
     };
 }
 
@@ -69,30 +74,30 @@ export function ZotFlowLockExtension(
 
             const fmEnd = fm.fmEnd;
 
-            // If the library-id resolves to a library where writes are
-            // disallowed entirely, reject all non-frontmatter edits.
-            const canEditMetadata =
-                fm.libraryId !== undefined &&
-                services.libraryCache.isBidirectional(fm.libraryId) &&
-                services.libraryCache.canWrite(fm.libraryId);
-            const canEditNotes =
-                fm.libraryId !== undefined &&
-                services.libraryCache.canEditNotes(fm.libraryId);
-            if (!canEditMetadata) {
-                let allowFmOnly = true;
-                tr.changes.iterChanges((fromChange, toChange) => {
-                    if (!allowFmOnly) return;
-                    if (toChange <= fmEnd) return;
-                    allowFmOnly = false;
-                });
-                return allowFmOnly;
-            }
-
-            // If library-id is present, editable regions are active
-            const regionsEnabled = fm.hasLibraryId;
-            const regions = regionsEnabled
+            // Editable regions are active for Zotero source notes
+            // (library-id) and local attachment source notes.
+            const regionsEnabled = fm.hasLibraryId || fm.isLocal;
+            const allRegions = regionsEnabled
                 ? (tr.startState.field(editableRegionsField, false) ?? [])
                 : [];
+
+            // Gating by region type:
+            // - PERSIST is local-only: always editable.
+            // - Local ANNO: editable for local attachment notes.
+            // - NOTE / ANNO: requires canEditNotes on the library.
+            // - ABSTRACT / TAGS: require canEditMetadata on the library.
+            const regions = allRegions.filter((r) => {
+                if (r.type === "PERSIST") return true;
+                if (fm.isLocal) return r.type === "ANNO";
+                if (fm.libraryId === undefined) return false;
+                if (r.type === "NOTE" || r.type === "ANNO") {
+                    return services.libraryCache.canEditNotes(fm.libraryId);
+                }
+                if (r.type === "ABSTRACT" || r.type === "TAGS") {
+                    return services.libraryCache.canEditMetadata(fm.libraryId);
+                }
+                return false;
+            });
             const unlocked =
                 tr.startState.field(unlockedRegionsField, false) ??
                 new Set<string>();
@@ -113,12 +118,6 @@ export function ZotFlowLockExtension(
                 // Check if change falls within an editable region that is unlocked
                 if (regions.length > 0) {
                     const inUnlockedRegion = regions.some((r) => {
-                        const canEditRegion =
-                            r.type === "ABSTRACT" || r.type === "TAGS"
-                                ? canEditMetadata
-                                : canEditNotes;
-                        if (!canEditRegion) return false;
-
                         // Determine if this region is currently unlocked
                         const isUnlocked = defaultLocked
                             ? unlocked.has(r.key) // default locked → toggle unlocks
@@ -128,10 +127,13 @@ export function ZotFlowLockExtension(
                             isUnlocked &&
                             fromChange >= r.from &&
                             toChange <= r.to &&
-                            // Protect BEG marker line
-                            !(fromChange <= r.begTo && toChange >= r.begFrom) &&
-                            // Protect END marker line
-                            !(fromChange <= r.endTo && toChange >= r.endFrom)
+                            // Protect the BEG/END marker text itself. Strict
+                            // overlap: a point insertion at a marker boundary
+                            // sits in the content (inline/zero-width regions
+                            // start right at the marker edge), while any edit
+                            // that consumes marker characters is rejected.
+                            !(fromChange < r.begTo && toChange > r.begFrom) &&
+                            !(fromChange < r.endTo && toChange > r.endFrom)
                         );
                     });
 

@@ -5,15 +5,18 @@ import type {
     ColorScheme,
     ChildEvents,
     AnnotationJSON,
+    ReaderNavigation,
 } from "types/zotero-reader";
 
 import { EditorView } from "@codemirror/view";
 import { Component, MarkdownRenderer, Platform } from "obsidian";
 import { v4 as uuidv4 } from "uuid";
-import { connect, WindowMessenger } from "penpal";
+import { connect, WindowMessenger, type Connection } from "penpal";
 import { getBlobUrls } from "bundle-assets/inline-assets";
 import { services } from "services/services";
 import { workerBridge } from "bridge";
+import { requestReaderSDT } from "ui/reader/sdt";
+import { EnhancementPackInstallModal } from "ui/modals/enhancement-pack-install";
 
 import type { IDBZoteroItem } from "types/db-schema";
 import type { AttachmentData } from "types/zotero-item";
@@ -47,6 +50,11 @@ type DirectBridgeBootstrap = () => {
     register: (childAPI: ChildAPI, token: string) => Promise<{ ok: boolean }>;
 };
 
+/** The child realm, while the bootstrap is parked on it. */
+type BridgeChildWindow = Window & {
+    __OBSIDIAN_BRIDGE__?: DirectBridgeBootstrap;
+};
+
 /** Penpal-based state machine managing the reader iframe lifecycle and bidirectional RPC. */
 export class IframeReaderBridge {
     private iframe: HTMLIFrameElement | null = null;
@@ -59,14 +67,39 @@ export class IframeReaderBridge {
         Set<(e: ChildEvents) => void>
     >();
     private connectTimeoutMs = 8000;
+    private childDestroyTimeoutMs = 3000;
     private readyPromiseResolver: (() => void) | null = null;
-    private readyPromiseRejecter: ((err: Error) => void) | null = null;
+    private connection: Connection | null = null;
+    private reconnectTimer: ReturnType<Window["setTimeout"]> | null = null;
+    private disconnectPromise: Promise<void> | null = null;
+    private permanentlyDisposed = false;
+    private readerInitPending = false;
 
     private editorList: EmbeddableMarkdownEditor[] = [];
     private rendererList: Component[] = [];
     private _readerOpts: CreateReaderOptions | undefined;
+    private packInstallModal?: EnhancementPackInstallModal;
 
     private token: string | null = null;
+
+    /**
+     * Bumped by every `connect()`. A connect whose generation is stale (because
+     * `reconnect()` superseded it) unwinds at its next checkpoint instead of
+     * driving a child that has already been thrown away.
+     */
+    private connectGeneration = 0;
+
+    /**
+     * `load` events seen on the CURRENT iframe element. Obsidian reparents the
+     * DOM when a panel is split or popped out, which reloads the iframe while
+     * the element itself survives — so anything past the first load means the
+     * child realm was replaced under us. Each `connect()` builds a new element,
+     * so this resets naturally and a reconnect's own first load never counts.
+     */
+    private iframeLoadCount = 0;
+
+    /** De-dupes overlapping reconnects (split, then immediately drag out). */
+    private reconnectPromise: Promise<void> | null = null;
 
     constructor(
         private container: HTMLElement,
@@ -75,6 +108,27 @@ export class IframeReaderBridge {
         private localAttachment?: TFile,
         private localDataManager?: LocalDataManager,
     ) {}
+
+    private async waitWithTimeout<T>(
+        promise: Promise<T>,
+        timeoutMs: number,
+        message: string,
+    ): Promise<T> {
+        let timeout: ReturnType<Window["setTimeout"]> | null = null;
+        try {
+            return await Promise.race([
+                promise,
+                new Promise<never>((_, reject) => {
+                    timeout = window.setTimeout(
+                        () => reject(new Error(message)),
+                        timeoutMs,
+                    );
+                }),
+            ]);
+        } finally {
+            if (timeout !== null) window.clearTimeout(timeout);
+        }
+    }
 
     /**
      * Listen to specific event types from the child iframe with type safety
@@ -86,7 +140,7 @@ export class IframeReaderBridge {
         if (!this.typedListeners.has(eventType)) {
             this.typedListeners.set(eventType, new Set());
         }
-        const typedCb = cb as (e: ChildEvents) => void;
+        const typedCb = cb;
         this.typedListeners.get(eventType)!.add(typedCb);
         return () => {
             const listeners = this.typedListeners.get(eventType);
@@ -127,7 +181,28 @@ export class IframeReaderBridge {
     }
 
     private buildParentAPI(): ParentAPI {
+        const generation = this.connectGeneration;
         return {
+            getSDTPack: (options) => {
+                const document = this._readerOpts;
+                if (!document)
+                    return Promise.resolve({
+                        ok: false,
+                        reason: "unavailable",
+                    });
+                return requestReaderSDT(
+                    document,
+                    options,
+                    () =>
+                        !this.permanentlyDisposed &&
+                        generation === this.connectGeneration &&
+                        this._readerOpts?.data === document.data,
+                    () => {
+                        this.packInstallModal =
+                            EnhancementPackInstallModal.show(services.app);
+                    },
+                );
+            },
             getBlobUrlMap: () => getBlobUrls(),
 
             isAndroidApp: () => Platform.isAndroidApp,
@@ -144,7 +219,14 @@ export class IframeReaderBridge {
             },
 
             getMathJaxConfig: () => {
-                return (window as any).MathJax?.config || {};
+                // Obsidian loads MathJax onto the window; it is absent until the
+                // first formula renders.
+                const mathJax = (
+                    window as {
+                        MathJax?: { config?: Record<string, unknown> };
+                    }
+                ).MathJax;
+                return mathJax?.config ?? {};
             },
 
             getColorScheme: () => {
@@ -160,7 +242,10 @@ export class IframeReaderBridge {
                 return services.settings;
             },
 
-            getLinkToSelection: (text: string, navigationInfo: any) => {
+            getLinkToSelection: (
+                text: string,
+                navigationInfo: ReaderNavigation,
+            ) => {
                 if (this.isLocal && this.localAttachment) {
                     const note = getLinkedLocalSourceNote(
                         services.app,
@@ -225,12 +310,14 @@ export class IframeReaderBridge {
                         type: "zotflow-citation",
                         libraryID,
                         key: parentKey,
-                        // The reader strips `libraryID` from annotations during
-                        // drag, so restore it from the attachment's library for
-                        // annotation-link generation.
+                        // The reader strips `libraryID`/`parentItem` from
+                        // annotations during drag, so restore them from the
+                        // attachment for annotation-link generation and the
+                        // CSL citation filter (page locator resolution).
                         annotations: annotations.map((a) => ({
                             ...stripAnnotationForPayload(a),
                             libraryID,
+                            parentItem: this.attachmentItem!.key,
                         })),
                     };
                     dataTransfer.setData(
@@ -288,9 +375,11 @@ export class IframeReaderBridge {
                             {
                                 libraryID: this.attachmentItem.libraryID,
                                 key: parentKey,
-                                annotations: annotations.map((a) =>
-                                    stripAnnotationForPayload(a),
-                                ),
+                                annotations: annotations.map((a) => ({
+                                    ...stripAnnotationForPayload(a),
+                                    libraryID: this.attachmentItem!.libraryID,
+                                    parentItem: this.attachmentItem!.key,
+                                })),
                             },
                             citationFormat,
                         );
@@ -316,8 +405,8 @@ export class IframeReaderBridge {
                 options: Partial<MarkdownEditorProps>,
             ) => {
                 const editor = createEmbeddableMarkdownEditor(
-                    (window as any).app,
-                    container as HTMLElement,
+                    services.app,
+                    container,
                     {
                         ...options,
                         onBlur: (editor) => {
@@ -348,7 +437,7 @@ export class IframeReaderBridge {
                 comp.load();
                 container.empty();
                 container.addClass("content");
-                MarkdownRenderer.render(
+                void MarkdownRenderer.render(
                     services.app,
                     text,
                     container,
@@ -368,16 +457,26 @@ export class IframeReaderBridge {
     }
 
     async connect() {
+        if (this.permanentlyDisposed) return;
         if (this._state !== "idle" && this._state !== "disposed") return;
         this._state = "connecting";
 
-        const readyPromise = new Promise<void>((resolve, reject) => {
-            this.readyPromiseResolver = resolve;
-            this.readyPromiseRejecter = reject;
+        const generation = ++this.connectGeneration;
+        /** True once `reconnect()` has started a newer attempt. */
+        const superseded = () => generation !== this.connectGeneration;
+
+        let resolveReady: () => void = () => {};
+        const readyPromise = new Promise<void>((resolve) => {
+            resolveReady = resolve;
+            this.readyPromiseResolver = resolveReady;
         });
 
-        // Create iframe
+        // Create iframe. A fresh element per connect, so `iframeLoadCount`
+        // counts loads of THIS element only.
+        this.iframeLoadCount = 0;
         const doc = this.container.ownerDocument; // Get the document of the container
+        // The container's owner document is already popout-safe, and the
+        // iframe must remain detached until it is fully configured below.
         this.iframe = doc.createElement("iframe");
         this.iframe.id = "zotero-reader-iframe";
         this.iframe.setCssStyles({
@@ -388,7 +487,10 @@ export class IframeReaderBridge {
         const src = getBlobUrls()["reader.html"]!;
 
         if (Platform.isAndroidApp) {
-            const srcdoc = await fetch(src).then((res) => res.text());
+            // `src` is a `blob:` URL built by the asset inliner, not a network
+            // address. `requestUrl` only speaks http(s) and cannot read one —
+            // see the `no-restricted-globals` carve-out in eslint.config.mts.
+            const srcdoc = await doc.win.fetch(src).then((res) => res.text());
             this.iframe.srcdoc = srcdoc;
         } else {
             this.iframe.src = src;
@@ -400,6 +502,8 @@ export class IframeReaderBridge {
         this.iframe.sandbox.add("allow-forms");
 
         this.iframe.onload = () => {
+            this.iframeLoadCount++;
+
             // Apply Obsidian color-scheme classes based on setting
             const scheme = services.settings.readerColorScheme;
             const iframeDoc = this.iframe?.contentDocument;
@@ -434,20 +538,36 @@ export class IframeReaderBridge {
                 }
             }
 
-            // Only handle unexpected reloads when we're in a stable state
-            if (
-                (this._state === "reader-ready" ||
-                    this._state === "bridge-ready") &&
-                this._readerOpts
-            ) {
-                // It was loaded before, but it was loaded again somehow
-                // We need to reconnect but avoid infinite loop
+            // A second load on the same element means Obsidian reparented the
+            // panel (split / pop-out) and the browser replaced the child realm.
+            // The old `child` reference and, crucially, penpal's WindowMessenger
+            // are both bound to a Window that no longer exists — penpal drops
+            // any message whose source is not the exact `remoteWindow` it was
+            // constructed with, so the connection cannot be re-pointed. Tearing
+            // down and rebuilding is the only recovery.
+            //
+            // Counting loads rather than inspecting `_state`/`_readerOpts` makes
+            // this independent of whether the child's handshake happened to beat
+            // the `load` event, and it recovers reloads that land before the
+            // first `initReader` too.
+            if (this.iframeLoadCount > 1 && !superseded()) {
                 services.logService.warn(
                     "Iframe reloaded unexpectedly, triggering reconnection",
                     "IframeReaderBridge",
                 );
-                // Use setTimeout to avoid potential stack overflow
-                setTimeout(() => this.reconnect(), 0);
+                // Deferred so the reconnect never runs inside the load handler.
+                if (this.reconnectTimer !== null) return;
+                this.reconnectTimer = window.setTimeout(() => {
+                    this.reconnectTimer = null;
+                    if (superseded() || this.permanentlyDisposed) return;
+                    void this.reconnect().catch((e: unknown) => {
+                        services.logService.error(
+                            "Reconnection after iframe reload failed",
+                            "IframeReaderBridge",
+                            e,
+                        );
+                    });
+                }, 0);
             }
         };
 
@@ -492,7 +612,7 @@ export class IframeReaderBridge {
                         });
                         // Make it non-enumerable & configurable (child can delete after use)
                         Object.defineProperty(
-                            this.iframe.contentWindow as any,
+                            this.iframe.contentWindow,
                             "__OBSIDIAN_BRIDGE__",
                             {
                                 value: _bridge,
@@ -505,31 +625,53 @@ export class IframeReaderBridge {
                 },
             },
         });
+        this.connection = conn;
 
-        // Wait for child to setup penpal connection
-        const remotePromise = conn.promise;
-        await Promise.race([
-            remotePromise,
-            new Promise<never>((_, rej) =>
-                setTimeout(
-                    () => rej(new Error("Child connect timeout")),
-                    this.connectTimeoutMs,
-                ),
-            ),
-        ]);
+        try {
+            // Wait for the child to set up its penpal connection.
+            await this.waitWithTimeout(
+                conn.promise,
+                this.connectTimeoutMs,
+                "Child connect timeout",
+            );
+            if (superseded()) return;
 
-        // Wait until the child calls register() (state becomes "ready") or timeout
-        await Promise.race([
-            readyPromise,
-            new Promise<never>((_, rej) =>
-                setTimeout(
-                    () => rej(new Error("Child connect timeout")),
-                    this.connectTimeoutMs,
-                ),
-            ),
-        ]);
+            // Then wait until the direct child API has registered.
+            await this.waitWithTimeout(
+                readyPromise,
+                this.connectTimeoutMs,
+                "Child connect timeout",
+            );
+        } catch (e) {
+            if (superseded()) return;
+            await this.disconnect();
+            throw e;
+        } finally {
+            if (this.readyPromiseResolver === resolveReady) {
+                this.readyPromiseResolver = null;
+            }
+        }
+        // `dispose()` resolves the ready promise so a superseded connect unwinds
+        // here immediately, instead of hanging until its timeout rejects.
+        if (superseded()) return;
 
-        if (this._readerOpts) {
+        // Replay the document into the fresh iframe. Only reachable on a
+        // reconnect: on a first connect `_readerOpts` is still unset, because
+        // both views await `connect()` before calling `initReader`.
+        //
+        // The `reader-ready` check covers the other order — if a caller does
+        // call `initReader` while we are still connecting, the bridge-ready
+        // queue has already served it by now, and replaying would load the
+        // document a second time.
+        //
+        // Read through the getter: control-flow analysis still has `_state`
+        // narrowed to the `"connecting"` assigned at the top of this method,
+        // because the mutation happens inside the `register` callback.
+        if (
+            this._readerOpts &&
+            this.state !== "reader-ready" &&
+            !this.readerInitPending
+        ) {
             // Update annotation json
             let newAnnotationJson: AnnotationJSON[] = [];
 
@@ -542,7 +684,12 @@ export class IframeReaderBridge {
             } else if (this.isLocal && this.localDataManager) {
                 newAnnotationJson = this.localDataManager.getAllAnnotations();
             }
+            if (superseded()) return;
 
+            // `_readerOpts` carries the view state as of the last
+            // `updateReaderOpts()` — the owning view refreshes it on every
+            // `viewStateChanged`, so the reader comes back where the user left
+            // it rather than where the file was first opened.
             const newReaderOpts: CreateReaderOptions = {
                 ...this._readerOpts,
                 annotations: newAnnotationJson,
@@ -550,6 +697,23 @@ export class IframeReaderBridge {
 
             await this.initReader(newReaderOpts);
         }
+    }
+
+    /**
+     * Merge a patch into the cached reader options used to replay the document
+     * after an unexpected iframe reload.
+     *
+     * The views call this from their `viewStateChanged` handler. Without it the
+     * cache keeps the snapshot taken when the file was opened, and a panel split
+     * or pop-out would scroll the reader back to that position.
+     *
+     * A no-op before the first `initReader` — there is nothing to replay yet,
+     * and the view reads the live state from `ViewStateService` in that window
+     * anyway.
+     */
+    updateReaderOpts(patch: Partial<CreateReaderOptions>) {
+        if (!this._readerOpts) return;
+        this._readerOpts = { ...this._readerOpts, ...patch };
     }
 
     private runAfterBridgeReady(fn: () => Promise<void>) {
@@ -577,14 +741,19 @@ export class IframeReaderBridge {
 
     initReader(opts: CreateReaderOptions) {
         this._readerOpts = opts;
+        this.readerInitPending = true;
         return this.runAfterBridgeReady(async () => {
-            await this.child!.initReader(opts);
-            this._state = "reader-ready";
+            try {
+                await this.child!.initReader(opts);
+                this._state = "reader-ready";
 
-            // Drain after reader ready queued calls
-            const tasks = [...this.afterReaderReadyQueue];
-            this.afterReaderReadyQueue.length = 0;
-            for (const t of tasks) await t();
+                // Drain after reader ready queued calls
+                const tasks = [...this.afterReaderReadyQueue];
+                this.afterReaderReadyQueue.length = 0;
+                for (const t of tasks) await t();
+            } finally {
+                this.readerInitPending = false;
+            }
         });
     }
 
@@ -606,34 +775,127 @@ export class IframeReaderBridge {
         });
     }
 
-    navigate(navigationInfo: any) {
+    navigate(navigationInfo: ReaderNavigation) {
         return this.runAfterReaderReady(async () => {
             await this.child!.navigate(navigationInfo);
         });
     }
 
-    async dispose(clearListeners = true) {
-        if (this._state === "disposed") return;
-        this.editorList.forEach((editor) => editor.onunload());
-        this.editorList.length = 0;
-        this.rendererList.forEach((comp) => comp.unload());
-        this.rendererList.length = 0;
-        this._state = "disposing";
-        try {
-            if (this.iframe?.contentWindow) {
-                delete (this.iframe.contentWindow as any).__ZREADER_BRIDGE__;
+    private disconnect(): Promise<void> {
+        if (this.disconnectPromise) return this.disconnectPromise;
+
+        this.disconnectPromise = (async () => {
+            if (
+                this._state === "disposed" &&
+                !this.iframe &&
+                !this.connection &&
+                !this.child
+            ) {
+                return;
             }
-        } catch {}
-        this.child = undefined;
-        this.iframe?.remove();
-        this.iframe = null;
-        if (clearListeners) this.typedListeners.clear();
-        this._state = "disposed";
+
+            this._state = "disposing";
+            ++this.connectGeneration;
+            this.packInstallModal?.close();
+            this.packInstallModal = undefined;
+
+            this.editorList.forEach((editor) => editor.onunload());
+            this.editorList.length = 0;
+            this.rendererList.forEach((comp) => comp.unload());
+            this.rendererList.length = 0;
+
+            if (this.reconnectTimer !== null) {
+                window.clearTimeout(this.reconnectTimer);
+                this.reconnectTimer = null;
+            }
+
+            const releasePendingConnect = this.readyPromiseResolver;
+            this.readyPromiseResolver = null;
+            releasePendingConnect?.();
+
+            const child = this.child;
+            const connection = this.connection;
+            const iframe = this.iframe;
+            if (iframe) iframe.onload = null;
+
+            try {
+                if (child) {
+                    await this.waitWithTimeout(
+                        child.destroy(),
+                        this.childDestroyTimeoutMs,
+                        "Reader child destroy timeout",
+                    );
+                }
+            } catch (e) {
+                services.logService.warn(
+                    "Reader child cleanup did not complete cleanly",
+                    "IframeReaderBridge",
+                    e,
+                );
+            } finally {
+                connection?.destroy();
+                if (this.connection === connection) this.connection = null;
+
+                try {
+                    if (iframe?.contentWindow) {
+                        delete (iframe.contentWindow as BridgeChildWindow)
+                            .__OBSIDIAN_BRIDGE__;
+                    }
+                } catch {
+                    // The browsing context may already have been replaced by
+                    // Obsidian reparenting. All local references are still
+                    // dropped below.
+                }
+
+                if (this.child === child) this.child = undefined;
+                iframe?.remove();
+                if (this.iframe === iframe) this.iframe = null;
+                this.token = null;
+                this.afterBridgeReadyQueue.length = 0;
+                this.afterReaderReadyQueue.length = 0;
+                this.readerInitPending = false;
+                this._state = "disposed";
+            }
+        })().finally(() => {
+            this.disconnectPromise = null;
+        });
+
+        return this.disconnectPromise;
     }
 
-    async reconnect() {
-        await this.dispose(false);
-        return this.connect();
+    async dispose() {
+        this.permanentlyDisposed = true;
+        await this.disconnect();
+
+        // Final close only. A reconnect deliberately keeps these so the new
+        // iframe can replay the document and retain the view's subscriptions.
+        this._readerOpts = undefined;
+        this.typedListeners.clear();
+        this.attachmentItem = undefined;
+        this.localAttachment = undefined;
+        this.localDataManager = undefined;
+    }
+
+    /**
+     * Rebuild the iframe and the penpal connection from scratch, keeping the
+     * cached reader options so the document is replayed.
+     *
+     * Concurrent callers share one attempt: a split immediately followed by a
+     * drag-out fires two `load` events, and starting two `connect()`s would
+     * leave the first orphaned on a detached iframe.
+     */
+    reconnect(): Promise<void> {
+        if (this.permanentlyDisposed) return Promise.resolve();
+        if (this.reconnectPromise) return this.reconnectPromise;
+        this.reconnectPromise = (async () => {
+            try {
+                await this.disconnect();
+                if (!this.permanentlyDisposed) await this.connect();
+            } finally {
+                this.reconnectPromise = null;
+            }
+        })();
+        return this.reconnectPromise;
     }
 
     public get state(): BridgeState {

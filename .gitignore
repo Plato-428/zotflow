@@ -1,5 +1,5 @@
 # vscode
-.vscode 
+.vscode
 
 # Intellij
 *.iml
@@ -23,3 +23,24 @@ data.json
 
 # esbuild
 meta.json
+
+# Local Obsidian memory monitor output
+.memory-logs/
+
+# CSL test fixtures (downloaded on first test run)
+tests/.csl-fixtures/
+
+# vitest coverage reports
+coverage/
+
+# Claude Code
+.claude
+
+# Internal Docs
+docs/
+
+# Local note-editor checkout (not tracked as a submodule)
+note-editor/note-editor/
+
+# Local Obsidian test harness (config, vault, profile, screenshots)
+.obsidian-test/

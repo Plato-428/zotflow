@@ -4,8 +4,13 @@ import { Menu, setIcon } from "obsidian";
 import type { ViewNode } from "./TreeView";
 import { TreeSearchContext } from "./TreeView";
 import { ObsidianIcon } from "../ObsidianIcon";
-import { getAttachmentFileIcon, getItemTypeIcon } from "ui/icons";
+import {
+    getAttachmentFileIcon,
+    getAttachmentFileTag,
+    getItemTypeIcon,
+} from "ui/icons";
 import { services } from "services/services";
+import { invalidateTagAutocompleteCache } from "ui/search/autocomplete-data";
 import { workerBridge } from "bridge";
 
 import {
@@ -75,28 +80,88 @@ export const NodeItem = ({ node, style }: NodeRendererProps<ViewNode>) => {
             break;
     }
 
-    const handleOnClick = (e: React.MouseEvent) => {
+    const handleArrowClick = (e: React.MouseEvent) => {
+        e.stopPropagation();
         node.toggle();
     };
 
-    const handleDoubleClick = async (e: React.MouseEvent) => {
+    const openPrimaryTarget = () => {
+        if (nodeType === "item" && node.data.itemType === "attachment") {
+            void openAttachment(
+                node.data.libraryID,
+                node.data.key,
+                services.app,
+            ).catch((err) => {
+                services.logService.error(
+                    "Failed to open attachment",
+                    "TreeView",
+                    err,
+                );
+                services.notificationService.notify(
+                    "error",
+                    "Failed to open attachment.",
+                );
+            });
+        } else if (nodeType === "item" && node.data.itemType === "note") {
+            void openItemNote(
+                node.data.libraryID,
+                node.data.key,
+                services.app,
+            ).catch((err) => {
+                services.logService.error(
+                    "Failed to open note preview",
+                    "TreeView",
+                    err,
+                );
+                services.notificationService.notify(
+                    "error",
+                    "Failed to open note.",
+                );
+            });
+        } else if (isTopLevelItem) {
+            void workerBridge.libraryNote
+                .openNote(node.data.libraryID, node.data.key, {
+                    forceUpdateContent: true,
+                    forceUpdateImages: false,
+                })
+                .catch((err) => {
+                    services.logService.error(
+                        "Failed to create/open note",
+                        "TreeView",
+                        err,
+                    );
+                    services.notificationService.notify(
+                        "error",
+                        "Failed to open source note.",
+                    );
+                });
+        } else {
+            node.toggle();
+        }
+    };
+
+    // The setting is read at event time so toggling it applies live.
+    const handleOnClick = (e: React.MouseEvent) => {
+        if (!services.settings.treeSingleClickOpen) {
+            node.toggle();
+            return;
+        }
+        openPrimaryTarget();
+    };
+
+    const handleDoubleClick = (e: React.MouseEvent) => {
+        if (services.settings.treeSingleClickOpen) return;
         e.stopPropagation();
         node.toggle();
 
         if (nodeType === "item" && node.data.itemType === "attachment") {
-            // Attachment: Open PDF
-            await openAttachment(
+            void openAttachment(
                 node.data.libraryID,
                 node.data.key,
                 services.app,
             );
         } else if (nodeType === "item" && node.data.itemType === "note") {
-            // Child note: Open read-only preview
-            await openItemNote(
-                node.data.libraryID,
-                node.data.key,
-                services.app,
-            );
+            void openItemNote(node.data.libraryID, node.data.key, services.app);
         }
     };
 
@@ -245,7 +310,7 @@ export const NodeItem = ({ node, style }: NodeRendererProps<ViewNode>) => {
                     .onClick(async () => {
                         try {
                             // Open/update the note file (foreground)
-                            workerBridge.libraryNote.openNote(
+                            await workerBridge.libraryNote.openNote(
                                 node.data.libraryID,
                                 node.data.key,
                                 {
@@ -325,35 +390,37 @@ export const NodeItem = ({ node, style }: NodeRendererProps<ViewNode>) => {
                 });
             }
         } else if (nodeType === "item" && node.data.itemType === "note") {
-            menu.addItem((item) => {
-                item.setTitle("Locate in Source Note")
-                    .setIcon("file-badge")
-                    .onClick(async () => {
-                        try {
-                            const located = await openItemNoteInSourceNote(
-                                node.data.libraryID,
-                                node.data.key,
-                                services.app,
-                            );
-                            if (!located) {
+            // A standalone note has no parent, so no source note to locate.
+            if (!isTopLevelItem)
+                menu.addItem((item) => {
+                    item.setTitle("Locate in Source Note")
+                        .setIcon("file-badge")
+                        .onClick(async () => {
+                            try {
+                                const located = await openItemNoteInSourceNote(
+                                    node.data.libraryID,
+                                    node.data.key,
+                                    services.app,
+                                );
+                                if (!located) {
+                                    services.notificationService.notify(
+                                        "warning",
+                                        "No source note found for this note.",
+                                    );
+                                }
+                            } catch (err) {
+                                services.logService.error(
+                                    "Failed to locate note in source note",
+                                    "TreeView",
+                                    err,
+                                );
                                 services.notificationService.notify(
-                                    "warning",
-                                    "No source note found for this note.",
+                                    "error",
+                                    "Failed to locate note in source note.",
                                 );
                             }
-                        } catch (err) {
-                            services.logService.error(
-                                "Failed to locate note in source note",
-                                "TreeView",
-                                err,
-                            );
-                            services.notificationService.notify(
-                                "error",
-                                "Failed to locate note in source note.",
-                            );
-                        }
-                    });
-            });
+                        });
+                });
             menu.addItem((item) => {
                 item.setTitle("Open in Note Editor (Experimental)")
                     .setIcon("pencil")
@@ -393,7 +460,7 @@ export const NodeItem = ({ node, style }: NodeRendererProps<ViewNode>) => {
                                 node.data.libraryID,
                                 node.data.key,
                             );
-                            services.taskMonitor.treeChanged.emit();
+                            services.eventHub.treeChanged.emit();
                             // Re-render the parent source note so the deleted
                             // note's editable region is removed.
                             if (parentKey) {
@@ -474,9 +541,10 @@ export const NodeItem = ({ node, style }: NodeRendererProps<ViewNode>) => {
                                         node.data.key,
                                         tags,
                                     );
+                                    invalidateTagAutocompleteCache();
 
                                     // Refresh the tree so chip display updates.
-                                    services.taskMonitor.treeChanged.emit();
+                                    services.eventHub.treeChanged.emit();
 
                                     // Re-render the owning source note if one
                                     // already exists (never create a new one).
@@ -552,20 +620,20 @@ export const NodeItem = ({ node, style }: NodeRendererProps<ViewNode>) => {
         }
 
         // Custom Drag Ghost using Obsidian classes
-        const ghost = document.createElement("div");
+        const ghost = createDiv();
         ghost.addClass("drag-ghost");
 
-        const self = document.createElement("div");
+        const self = createDiv();
         self.addClass("drag-ghost-self");
 
         setIcon(self, iconName || "file");
 
-        const titleSpan = document.createElement("span");
+        const titleSpan = createSpan();
         titleSpan.textContent = node.data.name || "Untitled";
 
         self.appendChild(titleSpan);
 
-        const action = document.createElement("div");
+        const action = createDiv();
         action.addClass("drag-ghost-action");
         action.textContent = isCitationDrag
             ? "Insert citation here"
@@ -605,8 +673,11 @@ export const NodeItem = ({ node, style }: NodeRendererProps<ViewNode>) => {
                 />
             ))}
 
-            {/* Arrow */}
-            <div className="zotflow-arrow-box">
+            {/* Arrow: own click zone; leaf placeholders stay row body */}
+            <div
+                className="zotflow-arrow-box"
+                onClick={isFolder ? handleArrowClick : undefined}
+            >
                 <ObsidianIcon
                     icon={node.isOpen ? "chevron-down" : "chevron-right"}
                     containerStyle={{
@@ -634,11 +705,12 @@ export const NodeItem = ({ node, style }: NodeRendererProps<ViewNode>) => {
             </span>
 
             {/* File Tag */}
-            {node.data.itemType === "attachment" && (
-                <div className="nav-file-tag">
-                    {node.data.name.split(".").pop()}
-                </div>
-            )}
+            {node.data.itemType === "attachment" &&
+                getAttachmentFileTag(node.data.contentType) && (
+                    <div className="nav-file-tag">
+                        {getAttachmentFileTag(node.data.contentType)}
+                    </div>
+                )}
 
             {/* Note Tag */}
             {node.data.itemType === "note" && (

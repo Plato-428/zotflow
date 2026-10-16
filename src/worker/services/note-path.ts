@@ -4,7 +4,19 @@ import type { AnyIDBZoteroItem } from "types/db-schema";
 import type { TFileWithoutParentAndVault } from "types/zotflow";
 import { db } from "db/db";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
-import { extractYear } from "utils/date";
+import { buildItemMetadata } from "utils/zotero-fields";
+import {
+    previewResult,
+    renderFragment,
+    renderLiquid,
+    strictFilterEngine,
+    trimmedStart,
+} from "./liquid-support";
+import { describeTemplateScope } from "./template-variables";
+import type {
+    TemplatePreviewResult,
+    TemplateVariables,
+} from "types/template-preview";
 import type { DbHelperService } from "./db-helper";
 
 const FALLBACK_ZOTERO_TEMPLATE =
@@ -15,7 +27,7 @@ const FALLBACK_LOCAL_TEMPLATE = "Source/Local/@{{basename}}";
 /** Sanitize a single path segment (filename or folder name). */
 function sanitizeSegment(segment: string): string {
     const illegalRe = /[/?<>\\:*|"]/g;
-    const controlRe = /[\x00-\x1f\x80-\x9f]/g;
+    const controlRe = /\p{Cc}/gu;
     const reservedRe = /^\.+$/;
     const windowsReservedRe = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
 
@@ -34,6 +46,7 @@ const IGNORE_KEYS: ReadonlySet<string> = new Set([
     "dateModified",
     "accessDate",
     "path",
+    "directory",
     "itemPaths",
 ]);
 
@@ -69,22 +82,106 @@ function sanitizeContext(
     return result;
 }
 
-/** Normalize a rendered path: collapse slashes, strip empties, append `.md`. */
-function sanitizePath(rawPath: string): string {
-    const normalized = rawPath.replace(/\\/g, "/").replace(/\/+/g, "/");
-    const segments = normalized.split("/").filter((s) => s.trim().length > 0);
-    return `${segments.join("/")}.md`;
+/**
+ * Longest path segment, in UTF-8 bytes. File systems allow 255 bytes per
+ * name; this leaves room for `.md` and the ` (n)` a note gets when its path
+ * is taken.
+ */
+export const MAX_SEGMENT_BYTES = 200;
+
+const utf8 = new TextEncoder();
+
+/** `Intl.Segmenter`, typed here: the project's TS lib predates it. */
+type GraphemeSegmenter = {
+    segment(text: string): Iterable<{ segment: string }>;
+};
+const SegmenterCtor = (
+    Intl as unknown as {
+        Segmenter?: new (
+            locale: undefined,
+            options: { granularity: "grapheme" },
+        ) => GraphemeSegmenter;
+    }
+).Segmenter;
+const graphemes = SegmenterCtor
+    ? new SegmenterCtor(undefined, { granularity: "grapheme" })
+    : null;
+
+/** User-perceived characters, so a cut never splits an emoji or accent. */
+function characters(text: string): string[] {
+    return graphemes
+        ? Array.from(graphemes.segment(text), (s) => s.segment)
+        : Array.from(text);
 }
+
+/**
+ * Cut a segment to MAX_SEGMENT_BYTES at a character boundary. Measured in
+ * bytes, since that is what the limit counts (a CJK character is three).
+ * Trailing spaces and dots left by the cut are dropped (Windows rejects them).
+ */
+function capSegment(segment: string): string {
+    if (utf8.encode(segment).length <= MAX_SEGMENT_BYTES) return segment;
+    let out = "";
+    let bytes = 0;
+    for (const c of characters(segment)) {
+        const n = utf8.encode(c).length;
+        if (bytes + n > MAX_SEGMENT_BYTES) break;
+        out += c;
+        bytes += n;
+    }
+    return out.replace(/[\s.]+$/u, "") || "_";
+}
+
+/** A rendered path's non-empty segments, slashes normalized. */
+function pathSegments(rawPath: string): string[] {
+    return rawPath
+        .replace(/\\/g, "/")
+        .split("/")
+        .filter((s) => s.trim().length > 0);
+}
+
+/**
+ * Normalize a rendered path: collapse slashes, strip empties, cap each
+ * segment's length, append `.md`.
+ */
+function sanitizePath(rawPath: string): string {
+    return `${pathSegments(rawPath).map(capSegment).join("/")}.md`;
+}
+
+/** Library path templates see every variable both bare and under `item`. */
+function libraryScope(ctx: Record<string, unknown>): Record<string, unknown> {
+    return { ...ctx, item: ctx };
+}
+
+/** The variables of a local path template. */
+function localPathContext(
+    localAttachment: TFileWithoutParentAndVault,
+): Record<string, unknown> {
+    const lastSlash = localAttachment.path.lastIndexOf("/");
+    return {
+        basename: localAttachment.basename,
+        name: localAttachment.name,
+        path: localAttachment.path,
+        directory:
+            lastSlash !== -1 ? localAttachment.path.substring(0, lastSlash) : "",
+        extension: localAttachment.extension,
+    };
+}
+
+const ENGINE_OPTIONS = { greedy: false };
 
 /** Resolves configurable note file paths via LiquidJS templates. */
 export class NotePathService {
     private engine: Liquid;
+    /** The engine for previews: unknown filters are errors there (`strictFilterEngine`). */
+    private previewEngine: Liquid;
 
     constructor(
         private settings: ZotFlowSettings,
         private dbHelper: DbHelperService,
     ) {
-        this.engine = new Liquid({ greedy: false });
+        this.engine = new Liquid(ENGINE_OPTIONS);
+        this.previewEngine = strictFilterEngine(this.engine, ENGINE_OPTIONS);
     }
 
     updateSettings(settings: ZotFlowSettings) {
@@ -100,27 +197,22 @@ export class NotePathService {
             templateOverride?.trim() ||
             this.settings.librarySourceNotePathTemplate.trim() ||
             FALLBACK_ZOTERO_TEMPLATE;
+        const context = await this.libraryPathContext(item);
+        // The same variables also sit under `item`, so `{{ item.title }}`
+        // works here as it does in source-note and citation templates.
+        const rendered = await renderLiquid(
+            this.engine,
+            template,
+            libraryScope(sanitizeContext(context)),
+        );
+        return sanitizePath(rendered);
+    }
 
-        const raw = item.raw || {};
-        const data = (raw.data || {}) as unknown as Record<string, unknown>;
-
+    private async libraryPathContext(
+        item: AnyIDBZoteroItem,
+    ): Promise<Record<string, unknown>> {
         const library = await db.libraries.get(item.libraryID);
         const libraryName = library?.name || "Unknown";
-
-        let creators: { name: string }[] = [];
-        if (raw.meta?.creatorsSummary) {
-            if (typeof raw.meta.creatorsSummary === "string") {
-                creators = [{ name: raw.meta.creatorsSummary }];
-            }
-        } else if (Array.isArray(data.creators)) {
-            creators = (data.creators as Array<Record<string, string>>).map(
-                (c) => ({
-                    name:
-                        c.name ||
-                        `${c.firstName || ""} ${c.lastName || ""}`.trim(),
-                }),
-            );
-        }
 
         const itemPaths = await this.dbHelper
             .getItemPaths([
@@ -132,48 +224,23 @@ export class NotePathService {
             ])
             .then((paths) => paths[`${item.libraryID}:${item.key}`] || []);
 
-        const context = {
+        return {
+            ...buildItemMetadata(item),
+
             // Identity
             key: item.key,
             version: item.version,
-            citationKey: item.citationKey || "",
             libraryID: item.libraryID,
             itemType: item.itemType,
             itemPaths: itemPaths,
 
-            // Metadata
-            title: item.title || "",
-            creators,
-            date: (data.date as string) || "",
             dateAdded: item.dateAdded,
             dateModified: item.dateModified,
-            accessDate: (data.accessDate as string) || "",
-            abstractNote: (data.abstractNote as string) || "",
-            publicationTitle: (data.publicationTitle as string) || "",
-            publisher: (data.publisher as string) || "",
-            place: (data.place as string) || "",
-            volume: (data.volume as string) || "",
-            issue: (data.issue as string) || "",
-            pages: (data.pages as string) || "",
-            series: (data.series as string) || "",
-            seriesNumber: (data.seriesNumber as string) || "",
-            edition: (data.edition as string) || "",
-            url: (data.url as string) || "",
-            DOI: (data.DOI as string) || "",
-            ISBN: (data.ISBN as string) || "",
-            ISSN: (data.ISSN as string) || "",
-            tags: (data.tags as Array<{ tag: string }>) || [],
+            tags: item.raw?.data?.tags || [],
 
             // Derived
             libraryName,
-            year: extractYear(data.date),
         };
-
-        const rendered = await this.engine.parseAndRender(
-            template,
-            sanitizeContext(context),
-        );
-        return sanitizePath(rendered);
     }
 
     /** Resolve the vault path for a local attachment source note. */
@@ -185,27 +252,23 @@ export class NotePathService {
             templateOverride?.trim() ||
             this.settings.localSourceNotePathTemplate.trim() ||
             FALLBACK_LOCAL_TEMPLATE;
-
-        const context = {
-            basename: localAttachment.basename,
-            name: localAttachment.name,
-            path: localAttachment.path,
-            extension: localAttachment.extension,
-        };
-
-        const rendered = await this.engine.parseAndRender(
+        const rendered = await renderLiquid(
+            this.engine,
             template,
-            sanitizeContext(context),
+            sanitizeContext(localPathContext(localAttachment)),
         );
         return sanitizePath(rendered);
     }
 
-    /** Preview the resolved path for a library item with a custom path template. */
+    /**
+     * Preview a library note path for the template tester. An empty template
+     * previews the built-in default, which is what an empty setting renders.
+     */
     async previewLibraryNotePath(
         libraryID: number,
         key: string,
         pathTemplate: string,
-    ): Promise<string> {
+    ): Promise<TemplatePreviewResult> {
         const item = await db.items.get([libraryID, key]);
         if (!item) {
             throw new ZotFlowError(
@@ -214,21 +277,101 @@ export class NotePathService {
                 `Item not found: ${libraryID}/${key}`,
             );
         }
-        return this.resolveLibraryNotePath(item, pathTemplate);
+        return this.previewPath(
+            pathTemplate,
+            FALLBACK_ZOTERO_TEMPLATE,
+            await this.libraryPathContext(item),
+            libraryScope,
+        );
     }
 
-    /** Preview the resolved path for a local file with a custom path template. */
+    /** Preview a local note path for the template tester; see `previewLibraryNotePath`. */
     async previewLocalNotePath(
         file: TFileWithoutParentAndVault,
         pathTemplate: string,
-    ): Promise<string> {
-        return this.resolveLocalNotePath(file, pathTemplate);
+    ): Promise<TemplatePreviewResult> {
+        return this.previewPath(
+            pathTemplate,
+            FALLBACK_LOCAL_TEMPLATE,
+            localPathContext(file),
+            (ctx) => ctx,
+        );
     }
 
-    /** Return the current path template string from settings. */
-    getDefaultPathTemplate(mode: "library" | "local"): string {
-        return mode === "library"
-            ? this.settings.librarySourceNotePathTemplate
-            : this.settings.localSourceNotePathTemplate;
+    /** The variables a library path template sees for this item (as sanitized), for the template tester. */
+    async describeLibraryNotePath(
+        libraryID: number,
+        key: string,
+    ): Promise<TemplateVariables> {
+        const item = await db.items.get([libraryID, key]);
+        if (!item) {
+            throw new ZotFlowError(
+                ZotFlowErrorCode.RESOURCE_MISSING,
+                "NotePathService",
+                `Item not found: ${libraryID}/${key}`,
+            );
+        }
+        return describeTemplateScope(
+            libraryScope(sanitizeContext(await this.libraryPathContext(item))),
+            this.engine,
+        );
+    }
+
+    /** The variables a local path template sees for this file (as sanitized), for the template tester. */
+    describeLocalNotePath(file: TFileWithoutParentAndVault): TemplateVariables {
+        return describeTemplateScope(
+            sanitizeContext(localPathContext(file)),
+            this.engine,
+        );
+    }
+
+    private previewPath(
+        template: string,
+        fallback: string,
+        context: Record<string, unknown>,
+        toScope: (ctx: Record<string, unknown>) => Record<string, unknown>,
+    ): Promise<TemplatePreviewResult> {
+        return previewResult(async (hints) => {
+            let { source, firstLine, firstCol } = trimmedStart(template);
+            if (!source) {
+                ({ source, firstLine, firstCol } = trimmedStart(fallback));
+                hints.push("The template is empty; this is the built-in default template.");
+            }
+            const rendered = await renderFragment(
+                this.previewEngine,
+                source,
+                toScope(sanitizeContext(context)),
+                firstLine,
+                firstCol,
+            );
+
+            // The same template over the values as they are tells whether
+            // sanitizing changed anything this template uses.
+            const unsanitized = await renderLiquid(
+                this.previewEngine,
+                source,
+                toScope(context),
+            );
+            if (unsanitized !== rendered) {
+                hints.push(
+                    'Some values were changed to be valid file names: characters such as / \\ : * ? " < > | are removed.',
+                );
+            }
+
+            const segments = pathSegments(rendered);
+            if (segments.length === 0) {
+                hints.push("The template renders an empty path.");
+            } else if (segments.some((s) => capSegment(s) !== s)) {
+                hints.push(
+                    `A folder or file name longer than ${MAX_SEGMENT_BYTES} bytes was shortened.`,
+                );
+            }
+            return { output: sanitizePath(rendered) };
+        });
+    }
+
+    /** The built-in path template for `mode`, used while its setting is empty. */
+    getBuiltInPathTemplate(mode: "library" | "local"): string {
+        return mode === "library" ? FALLBACK_ZOTERO_TEMPLATE : FALLBACK_LOCAL_TEMPLATE;
     }
 }

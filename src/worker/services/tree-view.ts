@@ -34,7 +34,8 @@ import type { AnyIDBZoteroItem, IDBZoteroCollection } from "types/db-schema";
 import type { ZotFlowSettings } from "settings/types";
 import type { IParentProxy } from "bridge/types";
 import type { LibraryService } from "./library";
-import type { SearchService, SearchableRecord } from "./search";
+import type { SearchMatcher, SearchableRecord } from "./search-matcher";
+import type { DisplayTitleService } from "./display-title";
 import { Zotero_Item_Types } from "types/zotero-item-const";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
 
@@ -60,9 +61,15 @@ export class TreeViewService {
         private settings: ZotFlowSettings,
         private parentHost: IParentProxy,
         private library: LibraryService,
-        private search: SearchService,
+        private matcher: SearchMatcher,
+        private displayTitle: DisplayTitleService,
     ) {
         this.treeTransferPayload = null;
+        // Item names come from the display title; rebuild on a new template.
+        this.displayTitle.onChange(() => {
+            this.treeTransferPayload = null;
+            this.searchIndex = null;
+        });
     }
 
     get tree() {
@@ -77,6 +84,42 @@ export class TreeViewService {
         this.treeTransferPayload = null;
         this.searchIndex = null;
         await this.getOptimizedTree();
+    }
+
+    /**
+     * Refreshes the entity fields of `keys` (name, tags, sync status) in the
+     * built tree and its search index, for an edit that leaves the tree's
+     * shape alone (a note's text, say).
+     *
+     * @returns the updated entities, to merge into the payload the view
+     *   holds; null when only a full rebuild will do (no tree built yet, or
+     *   an item is missing from it or from the database).
+     */
+    public async patchEntities(libraryID: number, keys: string[]): Promise<EntityMap | null> {
+        const payload = this.treeTransferPayload;
+        if (!payload) return null;
+        const rows = await db.items.bulkGet(keys.map((k): [number, string] => [libraryID, k]));
+        const patch: EntityMap = {};
+        for (const row of rows) {
+            const entity = row && payload.entities[row.key];
+            if (!row || !entity || entity.libraryID !== libraryID) return null;
+            const names = this.displayTitle.searchNames(row);
+            // Children are named "Untitled" when empty, as the build does.
+            const name = row.parentItem ? names.name || "Untitled" : names.name;
+            patch[row.key] = {
+                ...entity,
+                name,
+                syncStatus: row.syncStatus,
+                tags: row.searchTags,
+                ...(entity.dateModified !== undefined ? { dateModified: row.dateModified } : {}),
+            };
+            const record = this.searchIndex?.get(row.key);
+            if (record) {
+                this.searchIndex!.set(row.key, { ...record, ...names, name, tags: row.searchTags });
+            }
+        }
+        Object.assign(payload.entities, patch);
+        return patch;
     }
 
     /**
@@ -97,7 +140,7 @@ export class TreeViewService {
      * Ancestor visibility and child propagation are handled on the client.
      */
     public async searchTree(rawQuery: string): Promise<TreeSearchResult> {
-        const parsed = this.search.parse(rawQuery);
+        const parsed = this.matcher.parse(rawQuery);
         if (!this.searchIndex) {
             await this.getOptimizedTree();
         }
@@ -107,7 +150,7 @@ export class TreeViewService {
         }
 
         const records = Array.from(index.values());
-        const matched = this.search.matchAndRank(parsed, records);
+        const matched = this.matcher.matchAndRank(parsed, records);
         return {
             matchedKeys: matched.map((r) => r.id),
             freeTokens: parsed.freeTokens,
@@ -298,16 +341,17 @@ export class TreeViewService {
                     (lib) => lib.id === item.libraryID,
                 );
                 const libName = libObj ? libObj.name : "Unknown Library";
+                const displayNames = this.displayTitle.searchNames(item);
 
                 if (item.itemType === "attachment") {
                     registerEntity(
                         item.key,
-                        item.title,
+                        displayNames.name,
                         item.itemType,
                         item.libraryID,
                         libName,
-                        item.raw.data.contentType,
                         undefined,
+                        item.raw.data.contentType,
                         item.dateAdded,
                         item.dateModified,
                         item.syncStatus,
@@ -316,7 +360,7 @@ export class TreeViewService {
                 } else {
                     registerEntity(
                         item.key,
-                        item.title,
+                        displayNames.name,
                         item.itemType,
                         item.libraryID,
                         libName,
@@ -331,7 +375,7 @@ export class TreeViewService {
 
                 registerSearch({
                     id: item.key,
-                    name: item.title || "",
+                    ...displayNames,
                     itemType: item.itemType,
                     creators: item.searchCreators,
                     tags: item.searchTags,
@@ -352,8 +396,10 @@ export class TreeViewService {
                 // Process attachments
                 attachments.forEach((att) => {
                     const attId = `${itemId}-att-${att.key}`;
-                    // Attachment name logic
-                    let attName = att.title;
+                    // Attachments follow the display title template; child
+                    // notes keep their own names.
+                    const attNames = this.displayTitle.searchNames(att);
+                    const attName = attNames.name;
                     let attContentType;
                     if (att.itemType === "attachment") {
                         attContentType = att.raw.data.contentType;
@@ -375,6 +421,7 @@ export class TreeViewService {
 
                     registerSearch({
                         id: att.key,
+                        ...attNames,
                         name: attName || "Untitled",
                         itemType: att.itemType,
                         tags: att.searchTags,

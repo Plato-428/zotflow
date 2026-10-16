@@ -1,19 +1,38 @@
 import { db } from "db/db";
+import {
+    createLocalItems,
+    deleteLocalItems,
+    mutateItem,
+    newLocalItem,
+} from "db/mutate";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
+import {
+    zotflowToZoteroLinks,
+    zoteroToZotflowLinks,
+} from "worker/convert/note-links";
+import { createDbNoteLinkResolver } from "./note-link-resolver";
+import { metaMd2html } from "worker/convert/annotation-comment";
+import {
+    matchReadStatusEmoji,
+    isRatingTag,
+    READ_STATUS_TAGS,
+} from "utils/special-tags";
 
 import type { IDBZoteroItem } from "types/db-schema";
 import type { NoteData } from "types/zotero-item";
 import type { IParentProxy } from "bridge/types";
 import type { ConvertService } from "./convert";
-import type { LibraryNoteService, UpdateOptions } from "./library-note";
+import type { LibraryNoteService } from "./library-note";
 import type { ZotFlowSettings } from "settings/types";
-import {
-    READ_STATUS_TAGS,
-    matchReadStatusEmoji,
-    isRatingTag,
-    type TagLike,
-} from "utils/special-tags";
-import { metaMd2html } from "worker/convert/annotation-comment";
+
+/**
+ * What happened to a note edit. `gone`: the note no longer exists (deleted in
+ * Zotero and removed by a sync, or deleted elsewhere) — the caller must keep
+ * the user's text and offer to save it as a new note (`saveAsNewNote`).
+ */
+export type NoteSaveResult =
+    | { status: "saved" }
+    | { status: "gone"; parentKey: string; parentExists: boolean };
 
 /**
  * CRUD service for Zotero **child note items** (the note items attached to
@@ -54,16 +73,28 @@ export class ItemNoteService {
             return "";
         }
 
-        const html: string = (item.raw.data as any).note ?? "";
+        const html: string = item.raw.data.note ?? "";
         if (!html.trim()) return "";
 
         const vaultConfig = await this.parentHost.getVaultConfig();
-        return this.convertService.html2md(html, {
+        let md = await this.convertService.html2md(html, {
             annotationImageFolder:
                 this.settings.annotationImageFolder.replace(/\/$/, "") ||
                 undefined,
             strictLineBreaks: vaultConfig.strictLineBreaks,
+            // Always on: display-only anchors, unconditionally stripped
+            // on save — there is no risk for a setting to guard.
+            linkCitationSpans: true,
         });
+
+        // Display native zotero:// links as ZotFlow links. Markdown-side on
+        // purpose: single-param zotero links pass the markdown serializer
+        // unescaped, and the multi-param zotflow links we emit here never
+        // go through a serializer again (see note-links.ts).
+        if (this.settings.convertNoteLinks) {
+            md = await zoteroToZotflowLinks(md, createDbNoteLinkResolver());
+        }
+        return md;
     }
 
     /**
@@ -85,27 +116,54 @@ export class ItemNoteService {
             );
         }
 
-        const key = this.generateTempKey();
-        const now = new Date().toISOString().split(".")[0] + "Z";
-        const library = parentItem.raw.library;
+        // Zotero only allows child notes under regular items. Guarding here
+        // covers every entry point (tree view, command palette, file menu).
+        if (
+            ["attachment", "note", "annotation"].includes(parentItem.itemType)
+        ) {
+            throw new ZotFlowError(
+                ZotFlowErrorCode.UNKNOWN,
+                "ItemNoteService",
+                `Cannot create a child note under a ${parentItem.itemType} item`,
+            );
+        }
 
-        const newItem: IDBZoteroItem<NoteData> = {
+        const key = await this.createNote(
+            libraryID,
+            parentKey,
+            "",
+            parentItem.raw.library,
+        );
+
+        this.parentHost.log(
+            "info",
+            `Created child note ${key} under ${parentKey}`,
+            "ItemNoteService",
+        );
+
+        // A new node: the tree is rebuilt.
+        this.parentHost.emit("treeChanged");
+        this.parentHost.emit(
+            "noteChangedByNoteView",
             libraryID,
             key,
-            itemType: "note",
-            parentItem: parentKey,
-            title: "",
-            collections: [],
-            dateAdded: now,
-            dateModified: now,
-            version: 0,
-            trashed: 0,
-            searchCreators: [],
-            searchTags: [],
-            syncStatus: "created",
-            syncedAt: now,
-            syncError: "",
-            raw: {
+            parentKey,
+        );
+
+        return key;
+    }
+
+    /** Stores a new note (`parentKey` "" for a standalone note) and returns its key. */
+    private async createNote(
+        libraryID: number,
+        parentKey: string,
+        html: string,
+        library: IDBZoteroItem<NoteData>["raw"]["library"],
+    ): Promise<string> {
+        const key = this.generateTempKey();
+        const now = new Date().toISOString().split(".")[0] + "Z";
+        const newItem: IDBZoteroItem<NoteData> = newLocalItem(
+            {
                 key,
                 version: 0,
                 library,
@@ -114,8 +172,8 @@ export class ItemNoteService {
                 data: {
                     key,
                     itemType: "note",
-                    parentItem: parentKey,
-                    note: "",
+                    ...(parentKey ? { parentItem: parentKey } : {}),
+                    note: html,
                     relations: {},
                     dateAdded: now,
                     dateModified: now,
@@ -124,27 +182,105 @@ export class ItemNoteService {
                     version: 0,
                 } as unknown as NoteData,
             },
-        };
+            libraryID,
+            "push",
+        );
+        await createLocalItems(libraryID, [
+            newItem,
+        ]);
+        return key;
+    }
 
-        await db.transaction("rw", db.items, async () => {
-            await db.items.put(newItem);
+    /** Markdown from the editor → the note HTML stored in Zotero. */
+    private async noteHtml(content: string): Promise<string> {
+        const vaultConfig = await this.parentHost.getVaultConfig();
+        let html = await this.convertService.md2html(content, {
+            strictLineBreaks: vaultConfig.strictLineBreaks,
         });
+        // Canonical storage keeps native zotero:// links so the note
+        // navigates with Zotero's reader after sync.
+        if (this.settings.convertNoteLinks) {
+            html = await zotflowToZoteroLinks(html, createDbNoteLinkResolver());
+        }
+        return html;
+    }
 
+    /**
+     * Saves text whose note is gone (see `NoteSaveResult`) as a new note:
+     * under `parentKey` if that item still exists, otherwise standalone.
+     *
+     * @returns the new note's key.
+     */
+    async saveAsNewNote(
+        libraryID: number,
+        parentKey: string,
+        content: string,
+    ): Promise<string> {
+        const parent = parentKey
+            ? await db.items.get([libraryID, parentKey])
+            : undefined;
+        const usable =
+            parent &&
+            !["attachment", "note", "annotation"].includes(parent.itemType);
+        const library =
+            parent?.raw.library ??
+            (await this.anyLibraryStub(libraryID));
+        const key = await this.createNote(
+            libraryID,
+            usable ? parentKey : "",
+            await this.noteHtml(content),
+            library,
+        );
         this.parentHost.log(
             "info",
-            `Created child note ${key} under ${parentKey}`,
+            `Saved the text of a deleted note as ${key}`,
             "ItemNoteService",
         );
-
-        // Notify main thread so the tree can refresh
-        this.parentHost.onNoteChangedByNoteView(libraryID, key, parentKey);
-
+        this.parentHost.emit("treeChanged");
+        this.parentHost.emit(
+            "noteChangedByNoteView",
+            libraryID,
+            key,
+            usable ? parentKey : "",
+        );
+        // The parent's source note shows the new note in place of the gone
+        // one; an editor open on it then edits the new note.
+        if (usable) {
+            this.sourceNoteService
+                .triggerUpdate(
+                    libraryID,
+                    parentKey,
+                    { forceUpdateContent: true, forceUpdateImages: false },
+                    false,
+                )
+                .catch((e) =>
+                    this.parentHost.log(
+                        "error",
+                        "Failed to update the source note after saving a new note",
+                        "ItemNoteService",
+                        e,
+                    ),
+                );
+        }
         return key;
+    }
+
+    /** The `library` block of an item payload, for a note with no parent to copy it from. */
+    private async anyLibraryStub(
+        libraryID: number,
+    ): Promise<IDBZoteroItem<NoteData>["raw"]["library"]> {
+        const lib = await db.libraries.get(libraryID);
+        return {
+            type: lib?.type ?? "user",
+            id: libraryID,
+            name: lib?.name ?? "",
+            links: {},
+        };
     }
 
     /**
      * Update the content of a Zotero child note item in IDB.
-     * Marks the item as "updated" so the next bidirectional sync pushes it to Zotero.
+     * Marks the item dirty (see `applyLocalEdit`) so the next sync pushes it to Zotero.
      *
      * @param origin — `"editor"` when called from the source-note editable
      *   region (skips re-rendering the source note to avoid a circular
@@ -156,41 +292,41 @@ export class ItemNoteService {
         noteKey: string,
         content: string,
         origin: "editor" | "note-view" = "note-view",
-    ): Promise<void> {
+        parentKeyHint = "",
+    ): Promise<NoteSaveResult> {
         const item = await db.items.get([libraryID, noteKey]);
 
         if (!item || item.itemType !== "note") {
             this.parentHost.log(
                 "warn",
-                `updateNoteContent: item ${noteKey} not found or not a note`,
+                `updateNoteContent: note ${noteKey} is gone; the text was not saved to it`,
                 "ItemNoteService",
             );
-            return;
+            return this.gone(libraryID, parentKeyHint);
         }
 
-        const updatedRaw = structuredClone(item.raw);
-        const vaultConfig = await this.parentHost.getVaultConfig();
+        const noteHtmlContent = await this.noteHtml(content);
 
-        (updatedRaw.data as any).note = await this.convertService.md2html(
-            content,
-            {
-                strictLineBreaks: vaultConfig.strictLineBreaks,
-            },
-        );
+        // Nothing changed (an edit typed and undone, a flush of text already
+        // written): no write, so the note is not marked for upload again.
+        const current = await db.items.get([libraryID, noteKey]);
+        if (current?.itemType === "note" && current.raw.data.note === noteHtmlContent) {
+            return { status: "saved" };
+        }
 
-        // Derive title from the updated HTML (same logic as normalize.ts)
-        const noteHtml: string = (updatedRaw.data as any).note ?? "";
-        const plainText = noteHtml.replace(/<[^>]+>/g, " ");
-        const title =
-            (plainText.split("\n")[0] ?? plainText).slice(0, 50).trim() ||
-            `Note ${noteKey}`;
-
-        await db.items.update([libraryID, noteKey], {
-            raw: updatedRaw,
-            title,
-            syncStatus: item.syncStatus === "created" ? "created" : "updated",
-            dateModified: new Date().toISOString(),
+        // The conversion above is async, so the row is re-read inside the
+        // write transaction rather than written back from `item`.
+        const updated = await mutateItem(libraryID, noteKey, "note", (data) => {
+            data.note = noteHtmlContent;
         });
+        if (!updated) {
+            this.parentHost.log(
+                "warn",
+                `updateNoteContent: note ${noteKey} disappeared during the edit`,
+                "ItemNoteService",
+            );
+            return this.gone(libraryID, item.parentItem);
+        }
 
         this.parentHost.log(
             "debug",
@@ -198,15 +334,19 @@ export class ItemNoteService {
             "ItemNoteService",
         );
 
-        // Notify main thread so the note-view and tree can react
+        // The tree shows the note's first line: patch that one node.
+        this.parentHost.emit("treeChanged", { libraryID, keys: [noteKey] });
+        // Notify main thread so the note views can react
         if (origin === "editor") {
-            this.parentHost.onNoteChangedByEditor(
+            this.parentHost.emit(
+                "noteChangedByEditor",
                 libraryID,
                 noteKey,
                 item.parentItem,
             );
         } else {
-            this.parentHost.onNoteChangedByNoteView(
+            this.parentHost.emit(
+                "noteChangedByNoteView",
                 libraryID,
                 noteKey,
                 item.parentItem,
@@ -234,64 +374,71 @@ export class ItemNoteService {
                     ),
                 );
         }
+        return { status: "saved" };
+    }
+
+    private async gone(
+        libraryID: number,
+        parentKey: string,
+    ): Promise<NoteSaveResult> {
+        const parentExists =
+            !!parentKey && !!(await db.items.get([libraryID, parentKey]));
+        return { status: "gone", parentKey, parentExists };
+    }
+
+    /** Generate a temporary 8-character alphanumeric key for locally-created items. */
+    private generateTempKey(): string {
+        let len = 8;
+        let allowedKeyChars = "23456789ABCDEFGHIJKLMNPQRSTUVWXYZ";
+
+        let randomstring = "";
+        for (let i = 0; i < len; i++) {
+            let rnum = Math.floor(Math.random() * allowedKeyChars.length);
+            randomstring += allowedKeyChars.substring(rnum, rnum + 1);
+        }
+        return randomstring;
     }
 
     /**
-     * Update the abstract field on a top-level Zotero item.
-     * Called from the source-note editable ABSTRACT region.
+     * Delete or soft-trash a child note.
+     */
+    async deleteNote(libraryID: number, noteKey: string): Promise<void> {
+        const item = await db.items.get([libraryID, noteKey]);
+        if (!item || item.itemType !== "note") return;
+
+        // Moves the note to Zotero's trash (`trashed` follows `deleted`); a
+        // note Zotero never received is simply removed.
+        const { removed } = await deleteLocalItems(libraryID, [noteKey]);
+
+        this.parentHost.log(
+            "info",
+            `Deleted note ${noteKey} (${removed.length > 0 ? "hard" : "soft"})`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
+     * Update the abstract of a top-level item in IDB.
+     * Stamped as a local edit via mutateItem so the next sync uploads it.
      */
     async updateItemAbstract(
         libraryID: number,
         itemKey: string,
         abstractText: string,
     ): Promise<void> {
-        const item = await db.items.get([libraryID, itemKey]);
-
-        if (!item) {
-            this.parentHost.log(
-                "warn",
-                `updateItemAbstract: item ${itemKey} not found`,
-                "ItemNoteService",
-            );
-            return;
-        }
-
-        // Abstract belongs to top-level bibliographic items, not child notes/
-        // annotations/attachments.
-        if (
-            item.itemType === "note" ||
-            item.itemType === "annotation" ||
-            item.itemType === "attachment"
-        ) {
-            this.parentHost.log(
-                "warn",
-                `updateItemAbstract: item ${itemKey} is not a top-level bibliographic item`,
-                "ItemNoteService",
-            );
-            return;
-        }
-
-        const updatedRaw = structuredClone(item.raw);
-        const rawData = (updatedRaw.data ?? {}) as unknown as Record<
-            string,
-            unknown
-        >;
         const nextAbstract = metaMd2html(abstractText.trim());
-        const currentAbstract = String(rawData.abstractNote ?? "").trim();
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) return;
 
-        // Avoid dirtying the record when the normalized content is unchanged.
+        const rawData = item.raw.data as unknown as Record<string, unknown>;
+        const currentAbstract =
+            typeof rawData.abstractNote === "string"
+                ? (rawData.abstractNote as string).trim()
+                : "";
         if (currentAbstract === nextAbstract) return;
 
-        rawData.abstractNote = nextAbstract;
-        updatedRaw.data = rawData as unknown as typeof updatedRaw.data;
-
-        const now = new Date().toISOString();
-        rawData.dateModified = now;
-
-        await db.items.update([libraryID, itemKey], {
-            raw: updatedRaw,
-            syncStatus: item.syncStatus === "created" ? "created" : "updated",
-            dateModified: now,
+        await mutateItem(libraryID, itemKey, (data) => {
+            (data as unknown as Record<string, unknown>).abstractNote = nextAbstract;
         });
 
         this.parentHost.log(
@@ -302,9 +449,44 @@ export class ItemNoteService {
     }
 
     /**
+     * Update the generic tags of an item, preserving special read-status and rating tags.
+     */
+    async updateItemTags(
+        libraryID: number,
+        itemKey: string,
+        tagNames: string[],
+    ): Promise<void> {
+        const item = await db.items.get([libraryID, itemKey]);
+        if (!item) return;
+
+        const currentRawTags = ((item.raw.data.tags ?? []) as Array<{ tag: string; type?: number }>);
+        const currentSpecial = currentRawTags.filter(
+            (t) =>
+                matchReadStatusEmoji(t.tag) !== undefined ||
+                isRatingTag(t.tag),
+        );
+
+        const newGeneric = tagNames
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0)
+            .map((t) => ({ tag: t }));
+
+        const nextTags = [...newGeneric, ...currentSpecial];
+
+        await mutateItem(libraryID, itemKey, (data) => {
+            data.tags = nextTags;
+        });
+
+        this.parentHost.log(
+            "debug",
+            `Updated tags for ${itemKey}`,
+            "ItemNoteService",
+        );
+    }
+
+    /**
      * Update the Zotero Reading List status tag on a top-level item.
-     * Called when the `read-status` frontmatter field is edited in Obsidian.
-     * Pass `null`/empty string to remove the status tag entirely.
+     * Pass null or empty string to remove the status tag.
      */
     async updateItemReadStatus(
         libraryID: number,
@@ -312,19 +494,7 @@ export class ItemNoteService {
         newEmoji: string | null,
     ): Promise<void> {
         const item = await db.items.get([libraryID, itemKey]);
-        if (!item) {
-            this.parentHost.log(
-                "warn",
-                `updateItemReadStatus: item ${itemKey} not found`,
-                "ItemNoteService",
-            );
-            return;
-        }
-        if (
-            item.itemType === "note" ||
-            item.itemType === "annotation" ||
-            item.itemType === "attachment"
-        ) {
+        if (!item || item.itemType === "note" || item.itemType === "annotation" || item.itemType === "attachment") {
             return;
         }
 
@@ -338,17 +508,11 @@ export class ItemNoteService {
             return;
         }
 
-        const rawData = (item.raw.data ?? {}) as unknown as Record<
-            string,
-            unknown
-        >;
-        const currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
+        const currentTags = ((item.raw.data.tags ?? []) as Array<{ tag: string; type?: number }>);
         const currentEmoji = currentTags
             .map((t) => matchReadStatusEmoji(t.tag))
             .find((e) => e !== undefined);
 
-        // No-op if the derived status already matches (avoids marking the
-        // item dirty on every startup metadata-cache scan).
         if ((currentEmoji ?? undefined) === normalizedEmoji) return;
 
         const nextTags = currentTags.filter(
@@ -358,7 +522,9 @@ export class ItemNoteService {
             nextTags.push({ tag: READ_STATUS_TAGS[normalizedEmoji]! });
         }
 
-        await this.applyTagUpdate(libraryID, itemKey, item, nextTags);
+        await mutateItem(libraryID, itemKey, (data) => {
+            data.tags = nextTags;
+        });
 
         this.parentHost.log(
             "debug",
@@ -368,9 +534,8 @@ export class ItemNoteService {
     }
 
     /**
-     * Update the Ethereal Style star-rating tag on a top-level item.
-     * Called when the `rating` frontmatter field is edited in Obsidian.
-     * Pass `null`/empty string to remove the rating tag entirely.
+     * Update the star rating tag on a top-level item.
+     * Pass null to remove the rating tag.
      */
     async updateItemRating(
         libraryID: number,
@@ -378,19 +543,7 @@ export class ItemNoteService {
         newStars: string | null,
     ): Promise<void> {
         const item = await db.items.get([libraryID, itemKey]);
-        if (!item) {
-            this.parentHost.log(
-                "warn",
-                `updateItemRating: item ${itemKey} not found`,
-                "ItemNoteService",
-            );
-            return;
-        }
-        if (
-            item.itemType === "note" ||
-            item.itemType === "annotation" ||
-            item.itemType === "attachment"
-        ) {
+        if (!item || item.itemType === "note" || item.itemType === "annotation" || item.itemType === "attachment") {
             return;
         }
 
@@ -404,11 +557,7 @@ export class ItemNoteService {
             return;
         }
 
-        const rawData = (item.raw.data ?? {}) as unknown as Record<
-            string,
-            unknown
-        >;
-        const currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
+        const currentTags = ((item.raw.data.tags ?? []) as Array<{ tag: string; type?: number }>);
         const currentStars = currentTags
             .map((t) => t.tag)
             .find((tag) => isRatingTag(tag));
@@ -420,7 +569,9 @@ export class ItemNoteService {
             nextTags.push({ tag: normalizedStars });
         }
 
-        await this.applyTagUpdate(libraryID, itemKey, item, nextTags);
+        await mutateItem(libraryID, itemKey, (data) => {
+            data.tags = nextTags;
+        });
 
         this.parentHost.log(
             "debug",
@@ -430,141 +581,101 @@ export class ItemNoteService {
     }
 
     /**
-     * Replace the generic (non read-status, non-rating) tag set on a
-     * top-level item. Called when the `tags` frontmatter field is edited in
-     * Obsidian. Read-status and rating tags are preserved untouched — those
-     * are managed separately via updateItemReadStatus/updateItemRating.
+     * Combined atomic update for frontmatter metadata changes (tags, read-status, rating, abstract).
+     * Single mutateItem transaction prevents races and ensures search index consistency.
      */
-    async updateItemTags(
+    async updateItemMetadata(
         libraryID: number,
         itemKey: string,
-        newTagNames: string[],
+        patch: {
+            tags?: string[];
+            readStatus?: string | null;
+            rating?: string | null;
+            abstract?: string;
+        },
     ): Promise<void> {
         const item = await db.items.get([libraryID, itemKey]);
-        if (!item) {
-            this.parentHost.log(
-                "warn",
-                `updateItemTags: item ${itemKey} not found`,
-                "ItemNoteService",
+        if (!item) return;
+
+        let tagsChanged = false;
+        let nextTags: Array<{ tag: string; type?: number }> = (item.raw.data.tags ?? []) as Array<{ tag: string; type?: number }>;
+
+        if (patch.tags !== undefined) {
+            const currentSpecial = nextTags.filter(
+                (t) =>
+                    matchReadStatusEmoji(t.tag) !== undefined ||
+                    isRatingTag(t.tag),
             );
-            return;
-        }
-        if (
-            item.itemType === "note" ||
-            item.itemType === "annotation" ||
-            item.itemType === "attachment"
-        ) {
-            return;
+            const newGeneric = patch.tags
+                .map((t) => t.trim())
+                .filter((t) => t.length > 0)
+                .map((t) => ({ tag: t }));
+            nextTags = [...newGeneric, ...currentSpecial];
+            tagsChanged = true;
         }
 
-        const rawData = (item.raw.data ?? {}) as unknown as Record<
-            string,
-            unknown
-        >;
-        const currentTags = (rawData.tags as TagLike[] | undefined) ?? [];
-
-        // Preserve read-status/rating tags — they're managed by their own
-        // dedicated update methods and rendered as separate frontmatter
-        // fields, not part of the generic `tags:` list.
-        const preserved = currentTags.filter(
-            (t) =>
-                matchReadStatusEmoji(t.tag) !== undefined ||
-                isRatingTag(t.tag),
-        );
-        const currentRemaining = currentTags.filter(
-            (t) =>
-                matchReadStatusEmoji(t.tag) === undefined &&
-                !isRatingTag(t.tag),
-        );
-
-        const normalizedNew = Array.from(
-            new Set(
-                newTagNames.map((t) => t.trim()).filter((t) => t.length > 0),
-            ),
-        );
-        const normalizedCurrent = currentRemaining.map((t) => t.tag);
-
-        // No-op if the (order-independent) tag set is unchanged — avoids
-        // marking the item dirty on every startup metadata-cache scan.
-        const sortedNew = [...normalizedNew].sort();
-        const sortedCurrent = [...normalizedCurrent].sort();
-        if (JSON.stringify(sortedNew) === JSON.stringify(sortedCurrent)) {
-            return;
+        if (patch.readStatus !== undefined) {
+            const normalizedEmoji = patch.readStatus?.trim() || undefined;
+            if (!normalizedEmoji || READ_STATUS_TAGS[normalizedEmoji]) {
+                const currentEmoji = nextTags
+                    .map((t) => matchReadStatusEmoji(t.tag))
+                    .find((e) => e !== undefined);
+                if ((currentEmoji ?? undefined) !== normalizedEmoji) {
+                    nextTags = nextTags.filter(
+                        (t) => matchReadStatusEmoji(t.tag) === undefined,
+                    );
+                    if (normalizedEmoji) {
+                        nextTags.push({ tag: READ_STATUS_TAGS[normalizedEmoji]! });
+                    }
+                    tagsChanged = true;
+                }
+            }
         }
 
-        const nextTags: TagLike[] = [
-            ...preserved,
-            ...normalizedNew.map((tag) => ({ tag })),
-        ];
+        if (patch.rating !== undefined) {
+            const normalizedStars = patch.rating?.trim() || undefined;
+            if (!normalizedStars || isRatingTag(normalizedStars)) {
+                const currentStars = nextTags
+                    .map((t) => t.tag)
+                    .find((tag) => isRatingTag(tag));
+                if ((currentStars ?? undefined) !== normalizedStars) {
+                    nextTags = nextTags.filter((t) => !isRatingTag(t.tag));
+                    if (normalizedStars) {
+                        nextTags.push({ tag: normalizedStars });
+                    }
+                    tagsChanged = true;
+                }
+            }
+        }
 
-        await this.applyTagUpdate(libraryID, itemKey, item, nextTags);
+        let abstractChanged = false;
+        let nextAbstract = "";
+        if (patch.abstract !== undefined) {
+            nextAbstract = metaMd2html(patch.abstract.trim());
+            const rawData = item.raw.data as unknown as Record<string, unknown>;
+            const currentAbstract =
+                typeof rawData.abstractNote === "string"
+                    ? (rawData.abstractNote as string).trim()
+                    : "";
+            if (currentAbstract !== nextAbstract) {
+                abstractChanged = true;
+            }
+        }
+
+        if (!tagsChanged && !abstractChanged) return;
+
+        await mutateItem(libraryID, itemKey, (data) => {
+            if (tagsChanged) {
+                data.tags = nextTags;
+            }
+            if (abstractChanged) {
+                (data as unknown as Record<string, unknown>).abstractNote = nextAbstract;
+            }
+        });
 
         this.parentHost.log(
             "debug",
-            `Updated tags for ${itemKey}`,
-            "ItemNoteService",
-        );
-    }
-
-    /** Shared helper: write a new tags array back onto the item's raw data. */
-    private async applyTagUpdate(
-        libraryID: number,
-        itemKey: string,
-        item: IDBZoteroItem<any>,
-        nextTags: TagLike[],
-    ): Promise<void> {
-        const updatedRaw = structuredClone(item.raw);
-        const rawData = (updatedRaw.data ?? {}) as unknown as Record<
-            string,
-            unknown
-        >;
-        rawData.tags = nextTags;
-        const now = new Date().toISOString();
-        rawData.dateModified = now;
-        updatedRaw.data = rawData as unknown as typeof updatedRaw.data;
-
-        await db.items.update([libraryID, itemKey], {
-            raw: updatedRaw,
-            syncStatus: item.syncStatus === "created" ? "created" : "updated",
-            dateModified: now,
-        });
-    }
-
-    /** Generate a temporary 8-character alphanumeric key for locally-created items. */
-    private generateTempKey(): string {
-        let len = 8;
-        let allowedKeyChars = "23456789ABCDEFGHIJKLMNPQRSTUVWXYZ";
-
-        var randomstring = "";
-        for (var i = 0; i < len; i++) {
-            var rnum = Math.floor(Math.random() * allowedKeyChars.length);
-            randomstring += allowedKeyChars.substring(rnum, rnum + 1);
-        }
-        return randomstring;
-    }
-
-    /**
-     * Delete or soft-trash a child note.
-     */
-    async deleteNote(libraryID: number, noteKey: string): Promise<void> {
-        const item = await db.items.get([libraryID, noteKey]);
-        if (!item || item.itemType !== "note") return;
-
-        if (item.syncStatus === "created") {
-            await db.items.delete([libraryID, noteKey]);
-        } else {
-            const updatedRaw = structuredClone(item.raw);
-            updatedRaw.data.deleted = true;
-            await db.items.update([libraryID, noteKey], {
-                trashed: 1,
-                raw: updatedRaw,
-                syncStatus: "updated",
-            });
-        }
-
-        this.parentHost.log(
-            "info",
-            `Deleted note ${noteKey} (${item.syncStatus === "created" ? "hard" : "soft"})`,
+            `Updated metadata for ${itemKey} (tags=${tagsChanged}, abstract=${abstractChanged})`,
             "ItemNoteService",
         );
     }

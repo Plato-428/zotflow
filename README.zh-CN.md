@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/wordmark-dark.svg">
+    <img src="assets/logo/wordmark-light.svg" alt="ZotFlow" width="320">
+  </picture>
+</p>
+
 # ZotFlow — 让你的科研工作流保持顺畅
 
 [English](README.md) | 简体中文
@@ -6,7 +13,7 @@
 
 ZotFlow 是一个 [Obsidian](https://obsidian.md) 社区插件，可将 [Zotero](https://www.zotero.org) 的核心能力直接带入你的库。你可以在不离开 Obsidian 的情况下阅读论文、标注 PDF、生成模板化来源笔记并插入引用。
 
-![ZotFlow Hero](docs/assets/hero.gif)
+![ZotFlow Hero](assets/hero.gif)
 
 ---
 
@@ -30,43 +37,43 @@ ZotFlow 是一个 [Obsidian](https://obsidian.md) 社区插件，可将 [Zotero]
 
 完整功能的 PDF/EPUB/HTML 阅读器，直接嵌入工作区并与 Obsidian 主题一致。高亮、下划线、手写、便签、区域截图等 Zotero 支持的标注类型都可用。
 
-![Built-in Reader](docs/assets/reader.gif)
+![Built-in Reader](assets/reader.gif)
 
 ### 🔄 真正的双向同步
 
 从 Zotero 拉取条目、元数据和标注，也可将改动回推到 Zotero。每个文献库可独立设置为 **双向**、**只读** 或 **忽略**。发生冲突时，可用字段级差异视图手动决策。
 
-![Bidirectional Sync](docs/assets/sync.gif)
+![Bidirectional Sync](assets/sync.gif)
 
 ### ✨ 模板驱动来源笔记
 
 每个 Zotero 条目都可生成一份 Markdown 来源笔记，并通过 [LiquidJS](https://liquidjs.com) 模板完全自定义。
 
-![Source Notes](docs/assets/source-notes.gif)
+![Source Notes](assets/source-notes.gif)
 
 ### 🗒️ 原生 Zotero 条目笔记支持
 
 无需离开 Obsidian，即可创建、编辑、删除 **Zotero 子笔记**。可在树视图右键创建，也可在专用标签页编辑，或在来源笔记可编辑区域内原位修改；改动自动保存并回写 Zotero。
 
-![Item Notes](docs/assets/item-notes.gif)
+![Item Notes](assets/item-notes.gif)
 
 ### 📝 标注任意库内文件
 
 如果你的 PDF/EPUB 不在 Zotero 中，也能用同一个阅读器打开。标注会保存到同目录 `.zf.json` 边车文件，无需 Zotero 账号。
 
-![Local Reader](docs/assets/local-reader.gif)
+![Local Reader](assets/local-reader.gif)
 
 ### 📎 多格式引用
 
 可插入 **Pandoc** (`[@key]`)、**Wikilink** (`[[Source/@key|Author (year)]]`)、**脚注** 或原始 **citekey**。支持从树视图拖拽、触发字符串自动补全（`@@`）以及阅读器快捷键复制；还可自动带入页码与摘录内容。
 
-![Citations](docs/assets/citations.gif)
+![Citations](assets/citations.gif)
 
 ### 🌳 Zotero 树视图与搜索弹窗
 
 在高性能虚拟树中浏览你的全部 Zotero 内容：文献库、集合、条目、附件。支持搜索、排序、拖拽、右键操作。双击附件即可打开，拖拽条目即可引用。
 
-![Tree View](docs/assets/tree-view.gif)
+![Tree View](assets/tree-view.gif)
 
 ### 🛠️ 还有更多
 
@@ -164,15 +171,89 @@ npm run dev:reader     # 阅读器 webpack watch（需单独终端）
 npm run lint
 ```
 
+### 在 Obsidian 中实测
+
+`npm run live:obsidian` 通过 Chrome DevTools Protocol 驱动一个独立的
+Obsidian 实例。它使用自己的配置目录（`--user-data-dir`），设置、IndexedDB
+和插件状态都不会影响你日常使用的 Obsidian，后者可以保持打开。
+
+前提：已安装 Obsidian，并准备一个自己的 Zotero API key，最好只授权一个专门用于
+测试的群组（同步测试会写入数据）。
+
+```bash
+npm run build:plugin
+npm run live:obsidian -- setup
+npm run live:obsidian -- launch
+ZOTFLOW_TEST_API_KEY=<key> npm run live:obsidian -- login
+```
+
+`setup` 会创建测试仓库（默认 `.obsidian-test/vault/`），把 `main.js`、
+`manifest.json`、`styles.css` 以硬链接方式放入 `.obsidian/plugins/zotflow/`，
+安装 [Hot Reload](https://github.com/pjeby/hot-reload) 插件（固定版本并校验
+checksum），并写入 `.obsidian-test/config.json`。整个 `.obsidian-test/` 已被 gitignore。可选参数：
+
+| 参数                | 默认值                                              |
+| ------------------- | --------------------------------------------------- |
+| `--vault <dir>`     | `.obsidian-test/vault`                              |
+| `--profile <dir>`   | `.obsidian-test/profile`                            |
+| `--port <n>`        | `9223`                                              |
+| `--obsidian <exe>`  | macOS：`/Applications/Obsidian.app/Contents/MacOS/Obsidian`；Windows：`%LOCALAPPDATA%\Programs\Obsidian\Obsidian.exe`；Linux：必填 |
+
+开发时以 watch 模式构建：
+
+```bash
+npm run live:obsidian -- dev
+```
+
+esbuild 原地重写 `main.js`，硬链接让仓库里的改动直接出现在 vault 中，Hot Reload
+会在每次构建后自动重载插件（直接用 `npm run dev:plugin` 也可以）。`git checkout`、
+编辑器的原子保存等"替换文件"的操作会使链接断开；`dev`、`launch`、`reload` 会检查
+并修复链接。vault 与仓库不在同一个卷时改为复制，同样由这些命令刷新。
+手动重载插件用 `npm run live:obsidian -- reload`。其他命令：`status`、
+`eval '<js>'`、`screenshot [out] [window]`、`logs [seconds]`、`targets`、
+`quit`，以及 `reset`（删除配置目录，从头开始）。环境变量 `ZF_OBSIDIAN_PATH`、
+`ZF_TEST_VAULT`、`ZF_TEST_PROFILE`、`ZF_TEST_PORT` 会覆盖配置文件。
+
+### Fixture 测试库
+
+`npm run live:fixtures` 在测试库中维护一组已知的 Zotero 数据：collection、多种条目类型
+（包括 case、patent 等字段名特殊的类型）、笔记、PDF/EPUB/HTML 附件，以及所有类型
+的注释。它只创建、修改、删除自己拥有的对象（通过 `extra`、笔记 HTML 中的标记，
+或位于 fixture 条目/`ZotFlow fixtures` collection 之下来识别），库中其他条目不受
+影响。仍建议使用独立的测试群组，因为同步测试会涉及整个库。
+
+```bash
+ZOTFLOW_TEST_API_KEY=<key> npm run live:fixtures -- libraries   # 选择目标库
+# 然后在 .obsidian-test/config.json 中设置 "fixtureLibrary": "groups/<id>"
+npm run live:fixtures -- plan      # 只读：查看 apply 会做哪些改动
+npm run live:fixtures -- apply     # 创建数据集，或在测试后重置
+npm run live:fixtures -- purge --yes
+```
+
+数据集定义在 `scripts/fixture-library.mjs`。附件文件在其中生成而非存入仓库：内容
+确定，重复 apply 时除非内容变化否则不会重新上传，注释也精确落在生成的文字上。每个
+对象的 key 由 fixture id 推导（`npm run live:fixtures -- keys attention-pdf`），测试可直接引用。
+
+### 内存泄露检查
+
+先启动测试实例（`npm run live:obsidian -- launch`），然后：
+
+```bash
+npm run live:memory
+```
+
+按 Enter 进行被动采样，输入 `g <标签>` 执行两次 GC 后采样，输入 `q`
+解除调试器并退出。采样结果会以 CSV 格式写入 `.memory-logs/`。
+
 ### 本地安装
 
 将 `main.js`、`manifest.json`、`styles.css` 复制到：
 
 ```
-<vault>/.obsidian/plugins/obsidian-zotflow/
+<vault>/.obsidian/plugins/zotflow/
 ```
 
-重载 Obsidian 后启用插件。
+文件夹名必须与 `manifest.json` 中的插件 id 一致。重载 Obsidian 后启用插件。
 
 ---
 
@@ -228,4 +309,12 @@ ZotFlow 站在许多优秀开源项目之上。感谢这些项目的团队与作
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=duanxianpi/obsidian-zotflow&type=date&legend=top-left)](https://www.star-history.com/#duanxianpi/obsidian-zotflow&type=date&legend=top-left)
+## Star History
+
+<a href="https://www.star-history.com/?repos=duanxianpi%2Fzotflow&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=duanxianpi/zotflow&type=date&theme=dark&legend=top-left&sealed_token=e8kUPFUYLwmk422vXhMsmDkyIhfh7d2OOS7MkZy9pTv7BOKo-bD_u7zJltqIE4y_rENgic0E_c7oCCkOuLy45s8abvMeT0zg8o3Che_nX3VLtkulbYNN6psab5MkyJ_F1cvze5qrZBnmCL5FFBSQlqWG74C7_EFdl7TmvLiGhFYSZS1rECOuFYTiI-C7" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=duanxianpi/zotflow&type=date&legend=top-left&sealed_token=e8kUPFUYLwmk422vXhMsmDkyIhfh7d2OOS7MkZy9pTv7BOKo-bD_u7zJltqIE4y_rENgic0E_c7oCCkOuLy45s8abvMeT0zg8o3Che_nX3VLtkulbYNN6psab5MkyJ_F1cvze5qrZBnmCL5FFBSQlqWG74C7_EFdl7TmvLiGhFYSZS1rECOuFYTiI-C7" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=duanxianpi/zotflow&type=date&legend=top-left&sealed_token=e8kUPFUYLwmk422vXhMsmDkyIhfh7d2OOS7MkZy9pTv7BOKo-bD_u7zJltqIE4y_rENgic0E_c7oCCkOuLy45s8abvMeT0zg8o3Che_nX3VLtkulbYNN6psab5MkyJ_F1cvze5qrZBnmCL5FFBSQlqWG74C7_EFdl7TmvLiGhFYSZS1rECOuFYTiI-C7" />
+ </picture>
+</a>

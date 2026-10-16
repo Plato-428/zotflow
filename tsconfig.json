@@ -15,6 +15,7 @@
 		"isolatedModules": true,
 		"strictNullChecks": true,
 		"strictBindCallApply": true,
+		"skipLibCheck": true,
 		"jsx": "react-jsx",
 		"allowSyntheticDefaultImports": true,
 		"useUnknownInCatchVariables": true,
@@ -24,7 +25,8 @@
 			"ES6",
 			"ES7"
 		],
-		"verbatimModuleSyntax": true
+		"verbatimModuleSyntax": true,
+		"resolveJsonModule": true
 	},
 	"include": [
 		"src/**/*.ts",

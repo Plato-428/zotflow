@@ -1,6 +1,7 @@
 import { ItemView, WorkspaceLeaf } from "obsidian";
 import { workerBridge } from "bridge";
 import { services } from "services/services";
+import { matchLeadingNoteMeta, stripLeadingNoteMeta } from "utils/note-meta";
 import {
     createEmbeddableMarkdownEditor,
     type EmbeddableMarkdownEditor,
@@ -9,16 +10,15 @@ import {
 import type { ViewStateResult } from "obsidian";
 import type { NoteData } from "types/zotero-item";
 import type { IDBZoteroItem } from "types/db-schema";
+import { fireAndForgetIn } from "utils/fire-and-forget";
+import {
+    promptNoteGone,
+    registerNoteTextSource,
+} from "ui/modals/note-gone-modal";
+
+const ff = fireAndForgetIn("NoteEditorView");
 
 export const NOTE_EDITOR_VIEW_TYPE = "zotflow-note-editor-view";
-
-/**
- * Regex matching the `<!-- ZF_NOTE_META ... -->` comment
- * that `html2md` prepends for round-trip fidelity.
- */
-const META_RE = /^(?:<!-- ZF_NOTE_META (.*?) -->)\n?/;
-
-const SAVE_DEBOUNCE_MS = 2000;
 
 interface NoteEditorState extends Record<string, unknown> {
     libraryID: number;
@@ -31,10 +31,9 @@ export class NoteEditorView extends ItemView {
     private editor?: EmbeddableMarkdownEditor;
     /** Stripped `<!-- ZF_NOTE_META ... -->` line to re-inject on save. */
     private metaLine = "";
-    private saveTimer?: ReturnType<typeof setTimeout>;
-    private unsubscribeTaskMonitor?: () => void;
+    private unsubscribeSyncFinished?: () => void;
     private unsubscribeNoteChanged?: () => void;
-    private lastSyncStatuses = new Map<string, string>();
+    private unregisterOpenHooks: (() => void)[] = [];
 
     constructor(leaf: WorkspaceLeaf) {
         super(leaf);
@@ -51,6 +50,34 @@ export class NoteEditorView extends ItemView {
 
     getIcon() {
         return "sticky-note";
+    }
+
+    async onOpen() {
+        const shows = (libraryID: number, noteKey: string) =>
+            this.noteItem?.libraryID === libraryID &&
+            this.noteItem.key === noteKey;
+        this.unregisterOpenHooks = [
+            // A gone note's prompt reads the text from here, and once it is
+            // saved as a new note, editing continues there.
+            registerNoteTextSource({
+                text: (libraryID, noteKey) =>
+                    shows(libraryID, noteKey) ? this.currentContent() : null,
+                saved: (libraryID, noteKey, newKey) => {
+                    if (!shows(libraryID, noteKey)) return;
+                    ff(
+                        this.switchToNote(libraryID, newKey),
+                        "Failed to open the new note",
+                    );
+                },
+            }),
+            // A written edit can change the note's title (its first line).
+            services.eventHub.noteChangedByNoteView.subscribe(
+                (libraryID, noteKey) => {
+                    if (!shows(libraryID, noteKey)) return;
+                    ff(this.refreshTitle(), "Failed to refresh the title");
+                },
+            ),
+        ];
     }
 
     async setState(
@@ -76,7 +103,7 @@ export class NoteEditorView extends ItemView {
             return;
         }
 
-        this.noteItem = item as IDBZoteroItem<NoteData>;
+        this.noteItem = item;
 
         // Update tab title
         this.updateTitle();
@@ -84,7 +111,7 @@ export class NoteEditorView extends ItemView {
         await this.renderContent();
         this.subscribeToSyncEvents();
         this.subscribeToNoteChanges();
-        super.setState(state, result);
+        return super.setState(state, result);
     }
 
     getState(): NoteEditorState {
@@ -113,11 +140,11 @@ export class NoteEditorView extends ItemView {
                 );
 
                 // Strip and store the metadata comment so the user cannot edit it
-                const metaMatch = markdown.match(META_RE);
+                const metaMatch = matchLeadingNoteMeta(markdown);
                 if (metaMatch) {
-                    this.metaLine = metaMatch[0]!;
+                    this.metaLine = metaMatch.raw;
                 }
-                editableContent = markdown.replace(META_RE, "");
+                editableContent = stripLeadingNoteMeta(markdown);
             }
 
             const wrapper = this.contentEl.createDiv({
@@ -130,7 +157,7 @@ export class NoteEditorView extends ItemView {
                 value: editableContent,
                 readableLineLength: true,
                 readOnly: !editable,
-                onChange: editable ? () => this.scheduleSave() : () => {},
+                onChange: editable ? () => this.sendContent() : () => {},
             });
         } catch (e) {
             services.logService.error(
@@ -155,51 +182,47 @@ export class NoteEditorView extends ItemView {
     }
 
     /**
-     * Debounced save: re-inject the metadata line and push to IDB via the worker.
+     * Sends the text (metadata line re-injected) to the worker's edit queue,
+     * which writes it once the user pauses — and first, should the source
+     * note re-render or a sync start meanwhile.
      */
-    private scheduleSave() {
-        if (this.saveTimer !== undefined) {
-            clearTimeout(this.saveTimer);
-        }
-        this.saveTimer = setTimeout(() => {
-            this.saveTimer = undefined;
-            this.saveContent();
-        }, SAVE_DEBOUNCE_MS);
+    private sendContent() {
+        const note = this.noteItem;
+        if (!note || !this.editor) return;
+        workerBridge.editQueue
+            .submitNote(
+                note.libraryID,
+                note.key,
+                this.currentContent(),
+                "note-view",
+                note.parentItem,
+                note.parentItem,
+            )
+            .catch((e: unknown) =>
+                services.logService.error(
+                    "Failed to send the note to the worker",
+                    "NoteEditorView",
+                    e,
+                ),
+            );
     }
 
-    private async saveContent() {
-        if (!this.noteItem || !this.editor) return;
+    /** Writes this note's waiting edits now (they are in the worker's queue). */
+    private async flushSave() {
+        const note = this.noteItem;
+        if (!note) return;
+        await workerBridge.editQueue.flushFor(note.libraryID, note.parentItem);
+    }
 
-        const content = this.metaLine + this.editor.value;
-
-        try {
-            await workerBridge.itemNote.updateNoteContent(
-                this.noteItem.libraryID,
-                this.noteItem.key,
-                content,
-            );
-
-            // Re-fetch to pick up the derived title
-            const updated = await workerBridge.dbHelper.getItem(
-                this.noteItem.libraryID,
-                this.noteItem.key,
-            );
-            if (updated && updated.itemType === "note") {
-                this.noteItem = updated as IDBZoteroItem<NoteData>;
-                this.updateTitle();
-            }
-
-            services.logService.debug(
-                `Saved note ${this.noteItem.key}`,
-                "NoteEditorView",
-            );
-        } catch (e) {
-            services.logService.error(
-                "Failed to save note content",
-                "NoteEditorView",
-                e,
-            );
-            services.notificationService.notify("error", "Failed to save note");
+    private async refreshTitle() {
+        if (!this.noteItem) return;
+        const updated = await workerBridge.dbHelper.getItem(
+            this.noteItem.libraryID,
+            this.noteItem.key,
+        );
+        if (updated && updated.itemType === "note") {
+            this.noteItem = updated;
+            this.updateTitle();
         }
     }
 
@@ -208,33 +231,23 @@ export class NoteEditorView extends ItemView {
      * note's library, re-fetch the item from IDB and refresh the editor.
      */
     private subscribeToSyncEvents() {
-        this.unsubscribeTaskMonitor?.();
-        this.lastSyncStatuses.clear();
+        this.unsubscribeSyncFinished?.();
 
-        this.unsubscribeTaskMonitor = services.taskMonitor.subscribe(
-            (tasks) => {
-                for (const task of tasks) {
-                    if (task.type !== "sync") continue;
+        this.unsubscribeSyncFinished = services.eventHub.syncFinished.subscribe(
+            (task) => {
+                if (task.status !== "completed") return;
 
-                    const prev = this.lastSyncStatuses.get(task.id);
-                    this.lastSyncStatuses.set(task.id, task.status);
-
-                    if (task.status !== "completed" || prev === "completed")
-                        continue;
-
-                    // Only refresh if the sync covers this note's library
-                    const taskLibId = task.input?.["libraryId"] as
-                        | number
-                        | undefined;
-                    if (
-                        taskLibId !== undefined &&
-                        taskLibId !== this.noteItem?.libraryID
-                    ) {
-                        continue;
-                    }
-
-                    this.refreshAfterSync();
+                // Only refresh if the sync covers this note's library
+                const taskLibId = task.input?.["libraryId"] as
+                    number | undefined;
+                if (
+                    taskLibId !== undefined &&
+                    taskLibId !== this.noteItem?.libraryID
+                ) {
+                    return;
                 }
+
+                ff(this.refreshAfterSync(), "Failed to refresh after sync");
             },
         );
     }
@@ -248,10 +261,10 @@ export class NoteEditorView extends ItemView {
         this.unsubscribeNoteChanged?.();
 
         this.unsubscribeNoteChanged =
-            services.taskMonitor.noteChangedByEditor.subscribe(
+            services.eventHub.noteChangedByEditor.subscribe(
                 (_libraryID, noteKey, _parentItemKey) => {
                     if (noteKey !== this.noteItem?.key) return;
-                    this.refreshAfterSync();
+                    ff(this.refreshAfterSync(), "Failed to refresh after sync");
                 },
             );
     }
@@ -260,23 +273,59 @@ export class NoteEditorView extends ItemView {
         if (!this.noteItem) return;
 
         // Flush pending saves before overwriting with synced content
-        if (this.saveTimer !== undefined) {
-            clearTimeout(this.saveTimer);
-            this.saveTimer = undefined;
-            await this.saveContent();
-        }
+        await this.flushSave();
 
         const item = await workerBridge.dbHelper.getItem(
             this.noteItem.libraryID,
             this.noteItem.key,
         );
 
-        if (!item || item.itemType !== "note") return;
+        if (!item || item.itemType !== "note") {
+            // Deleted in Zotero: keep what is on screen and say so.
+            const parentKey = this.noteItem.parentItem;
+            const parent = parentKey
+                ? await workerBridge.dbHelper.getItem(
+                      this.noteItem.libraryID,
+                      parentKey,
+                  )
+                : undefined;
+            this.promptGone(parentKey, !!parent);
+            return;
+        }
 
-        this.noteItem = item as IDBZoteroItem<NoteData>;
+        this.noteItem = item;
         this.updateTitle();
 
         await this.renderContent();
+    }
+
+    /**
+     * The note is gone (deleted in Zotero): the text stays in the editor and
+     * the user is asked to save it as a new note — the same prompt as for
+     * an edit that finds it gone. Once saved, editing continues on the new
+     * note (see `onOpen`).
+     */
+    private promptGone(parentKey: string, parentExists: boolean) {
+        const note = this.noteItem;
+        if (!note) return;
+        promptNoteGone({
+            libraryID: note.libraryID,
+            noteKey: note.key,
+            parentKey,
+            parentExists,
+            content: this.currentContent(),
+        });
+    }
+
+    private currentContent(): string {
+        return this.metaLine + (this.editor?.value ?? "");
+    }
+
+    private async switchToNote(libraryID: number, key: string) {
+        const item = await workerBridge.dbHelper.getItem(libraryID, key);
+        if (!item || item.itemType !== "note") return;
+        this.noteItem = item;
+        this.updateTitle();
     }
 
     private updateTitle() {
@@ -289,10 +338,6 @@ export class NoteEditorView extends ItemView {
     }
 
     private destroyEditor() {
-        if (this.saveTimer !== undefined) {
-            clearTimeout(this.saveTimer);
-            this.saveTimer = undefined;
-        }
         if (this.editor) {
             this.editor.destroy();
             this.editor = undefined;
@@ -300,16 +345,12 @@ export class NoteEditorView extends ItemView {
     }
 
     async onClose() {
-        this.unsubscribeTaskMonitor?.();
-        this.unsubscribeTaskMonitor = undefined;
+        this.unsubscribeSyncFinished?.();
+        this.unsubscribeSyncFinished = undefined;
         this.unsubscribeNoteChanged?.();
         this.unsubscribeNoteChanged = undefined;
-        // Flush any pending save before closing
-        if (this.saveTimer !== undefined) {
-            clearTimeout(this.saveTimer);
-            this.saveTimer = undefined;
-            await this.saveContent();
-        }
+        for (const unregister of this.unregisterOpenHooks) unregister();
+        this.unregisterOpenHooks = [];
         this.destroyEditor();
         this.contentEl.empty();
     }

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/wordmark-dark.svg">
+    <img src="assets/logo/wordmark-light.svg" alt="ZotFlow" width="320">
+  </picture>
+</p>
+
 # ZotFlow — Keep Your Research in Flow
 
 English | [简体中文](README.zh-CN.md)
@@ -6,7 +13,7 @@ English | [简体中文](README.zh-CN.md)
 
 ZotFlow is a community plugin for [Obsidian](https://obsidian.md) that brings the full power of [Zotero](https://www.zotero.org) into your vault. Read papers, annotate PDFs, generate templated source notes, and cite literature — all without ever leaving Obsidian.
 
-![ZotFlow Hero](docs/assets/hero.gif)
+![ZotFlow Hero](assets/hero.gif)
 
 ---
 
@@ -30,37 +37,37 @@ If any of these sound like you, ZotFlow was built for you:
 
 A full-featured PDF/EPUB/HTML reader, embedded right in your workspace and **themed to match Obsidian**. Highlight, underline, draw, add sticky notes, capture image regions — every annotation type Zotero supports, in a window that finally feels like home.
 
-![Built-in Reader](docs/assets/reader.gif)
+![Built-in Reader](assets/reader.gif)
 
 ### 🔄 True Bidirectional Sync
 
-Pull items, metadata, and annotations from Zotero — and push your changes back. Configure each library independently as **Bidirectional**, **Read-Only**, or **Ignored**. When conflicts happen, a field-level diff viewer lets you decide what to keep.
+Pull items, metadata, and annotations from Zotero — and push your changes back. Configure each library independently as **Bidirectional**, **Read-Only**, or **Ignored**. Sync works like Zotero's own: changes to different fields (or different tags) on both sides merge automatically, and only a field changed differently on both sides — or an item deleted on one side and changed on the other — becomes a conflict. A field-level diff viewer lets you decide what to keep; items deleted in Zotero together are resolved together.
 
-![Bidirectional Sync](docs/assets/sync.gif)
+![Bidirectional Sync](assets/sync.gif)
 
 ### ✨ Template-Powered Source Notes
 
 Every Zotero item gets one auto-generated Markdown note, rendered with [LiquidJS](https://liquidjs.com) templates you fully control.
 
-![Source Notes](docs/assets/source-notes.gif)
+![Source Notes](assets/source-notes.gif)
 
 ### 🗒️ Native Zotero Item Notes
 
 Create, edit, and delete **Zotero child notes** without leaving Obsidian. Right-click any item in the Tree View to add a note, edit it in a dedicated tab with Obsidian's full Markdown editor, or unlock its region inside the parent source note and edit in place. Every change auto-saves and syncs back to Zotero.
 
-![Item Notes](docs/assets/item-notes.gif)
+![Item Notes](assets/item-notes.gif)
 
 ### 📝 Annotate Any Vault File
 
 Have PDFs or EPUBs that aren't in Zotero? Open them with the same reader. Annotations save into a co-located `.zf.json` sidecar — no Zotero account required. Perfect for personal notes, downloaded papers, or books you're reading.
 
-![Local Reader](docs/assets/local-reader.gif)
+![Local Reader](assets/local-reader.gif)
 
 ### 📎 Multi-Format Citations
 
 Insert citations as **Pandoc** (`[@key]`), **Wikilink** (`[[Source/@key|Author (year)]]`), **Footnote**, or raw **citekey** — via drag-and-drop from the tree view, autocomplete with a trigger string (`@@`), or copy-from-reader hotkeys. Include annotation context (page numbers, quoted text) automatically.
 
-![Citations](docs/assets/citations.gif)
+![Citations](assets/citations.gif)
 
 ### 🌳 Zotero Tree View & Search Modal
 
@@ -68,7 +75,7 @@ Browse your entire Zotero universe — libraries, collections, items, attachment
 
 Or open the search modal from the command palette, type to filter your library, and hit Enter to jump to an item or open its attachment.
 
-![Tree View](docs/assets/tree-view.gif)
+![Tree View](assets/tree-view.gif)
 
 ### 🛠️ And a Whole Lot More
 
@@ -166,15 +173,143 @@ npm run dev:reader     # webpack watch mode (reader, separate terminal)
 npm run lint
 ```
 
+### Live testing in Obsidian
+
+`npm run live:obsidian` drives a separate Obsidian instance over the Chrome
+DevTools Protocol. It runs with its own profile (`--user-data-dir`), so its
+settings, IndexedDB and plugin state never touch your everyday Obsidian, which
+can stay open.
+
+Requirements: Obsidian installed, and a Zotero API key of your own, ideally
+limited to a group you only use for testing (sync tests write to it).
+
+```bash
+npm run build:plugin
+npm run live:obsidian -- setup
+npm run live:obsidian -- launch
+ZOTFLOW_TEST_API_KEY=<key> npm run live:obsidian -- login
+```
+
+`setup` creates a test vault (default `.obsidian-test/vault/`), hard-links
+`main.js`, `manifest.json` and `styles.css` into
+`.obsidian/plugins/zotflow/`, installs the
+[Hot Reload](https://github.com/pjeby/hot-reload) plugin (pinned version,
+checksum-verified), and writes `.obsidian-test/config.json`. All of
+`.obsidian-test/` is gitignored. Options:
+
+| Option              | Default                                             |
+| ------------------- | --------------------------------------------------- |
+| `--vault <dir>`     | `.obsidian-test/vault`                              |
+| `--profile <dir>`   | `.obsidian-test/profile`                            |
+| `--port <n>`        | `9223`                                              |
+| `--obsidian <exe>`  | macOS: `/Applications/Obsidian.app/Contents/MacOS/Obsidian`; Windows: `%LOCALAPPDATA%\Programs\Obsidian\Obsidian.exe`; Linux: required |
+
+For a live edit loop, run the build in watch mode:
+
+```bash
+npm run live:obsidian -- dev
+```
+
+esbuild rewrites `main.js` in place, which the hard link makes visible inside
+the vault, so Hot Reload reloads the plugin after every rebuild (plain
+`npm run dev:plugin` works too). Anything that replaces a file instead of
+rewriting it, such as `git checkout` or an editor's atomic save, breaks its
+link; `dev`, `launch` and `reload` re-check and repair the links. A vault on a
+different volume than the repo gets copies instead, refreshed by the same
+commands. `npm run live:obsidian -- reload` reloads the plugin by hand. Other
+commands: `status`, `eval '<js>'`, `screenshot [out] [window]`,
+`logs [seconds]`, `targets`, `quit`, and `reset` (deletes the profile for a
+fresh start). The environment variables `ZF_OBSIDIAN_PATH`, `ZF_TEST_VAULT`,
+`ZF_TEST_PROFILE` and `ZF_TEST_PORT` override the config.
+
+### Fixture library
+
+`npm run live:fixtures` keeps a known set of Zotero data in your test library:
+collections, items of several types (including ones whose fields have their
+own names, like cases and patents), notes, PDF/EPUB/HTML attachments, and
+every annotation type. It only creates, updates and deletes objects it owns
+(marked in `extra`, in the note HTML, or by being under a fixture item or the
+`ZotFlow fixtures` collection), so other items in the library are left alone.
+A dedicated test group is still recommended, since sync tests touch the whole
+library.
+
+```bash
+ZOTFLOW_TEST_API_KEY=<key> npm run live:fixtures -- libraries   # pick a library
+# then set "fixtureLibrary": "groups/<id>" in .obsidian-test/config.json
+npm run live:fixtures -- plan      # what apply would change, read-only
+npm run live:fixtures -- apply     # create the set, or reset it after tests
+npm run live:fixtures -- purge --yes
+```
+
+The set is defined in `scripts/fixture-library.mjs`. Attachment files are
+generated there, not stored: deterministic bytes, so a re-apply uploads
+nothing unless the content changes, and annotations are placed on the
+generated text. Each object's key derives from its fixture id
+(`npm run live:fixtures -- keys attention-pdf`), so tests can address it directly.
+
+### Live sync tests
+
+`npm run live:sync` runs end-to-end sync tests against the test instance and
+the fixture library: pull, push, conflicts, faults (requests dropped after the
+server applied them, or never sent) and concurrency (another client writing
+mid-sync). They need the instance launched, a fresh `npm run build:plugin`,
+and `zoteroApiKey` plus a `groups/<id>` `fixtureLibrary` in
+`.obsidian-test/config.json`. Every test resets the group to the fixture set,
+so use a group you only use for testing. Run a subset with
+`npm run live:sync -- pull conflicts`. `npm run live:sync -- server` probes,
+straight against the API and without Obsidian, the server behaviour the sync
+engine relies on (batch DELETE, `version: 0` creates, patch uploads, version
+checks).
+`npm run live:sync -- upgrade` lets the released 1.6.6 build make a database
+full of pending edits and conflicts, then opens it with the current build
+(the v7 migration) and syncs; it downloads that release's `main.js` once.
+
+### Memory leak checks
+
+With the test instance running (`npm run live:obsidian -- launch`):
+
+```bash
+npm run live:memory
+```
+
+Press Enter for a passive sample, use `g <label>` for a double-GC checkpoint,
+and `q` to detach and quit. Samples are written to `.memory-logs/` as CSV.
+
 ### Local install
 
 Copy `main.js`, `manifest.json`, and `styles.css` to:
 
 ```
-<vault>/.obsidian/plugins/obsidian-zotflow/
+<vault>/.obsidian/plugins/zotflow/
 ```
 
-Reload Obsidian and enable the plugin.
+The folder name must match the plugin id in `manifest.json`. Reload Obsidian
+and enable the plugin.
+
+### Maintainer release workflow
+
+`dev` is the only long-lived development branch. `master` contains only code
+that has already been published as a stable release. Feature branches merge
+into `dev`; beta versions are immutable tags on existing `dev` commits, so no
+beta version is committed to `package.json` or `manifest.json`.
+
+After the `dev` CI run is green, preview or publish the next beta with:
+
+```bash
+npm run beta:next -- patch
+npm run beta -- patch
+```
+
+The second command calculates the next `x.y.z-beta.N`, creates an annotated
+tag, and pushes only that tag. Use `minor` or `major` instead of `patch` when
+the beta targets that type of stable release. The tag workflow builds temporary
+beta metadata and publishes a non-draft GitHub prerelease without changing the
+branch files.
+
+For a stable release, run `npm version patch`, `minor`, or `major` on `dev`,
+push the commit and tag, and inspect the generated Draft Release. Publish the
+release before merging that exact stable tag into `master`. Never move or reuse
+a published tag.
 
 ---
 
@@ -230,4 +365,10 @@ Have ideas or found a bug? Join the Discord!
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=duanxianpi/obsidian-zotflow&type=date&legend=top-left)](https://www.star-history.com/#duanxianpi/obsidian-zotflow&type=date&legend=top-left)
+<a href="https://www.star-history.com/?repos=duanxianpi%2Fzotflow&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=duanxianpi/zotflow&type=date&theme=dark&legend=top-left&sealed_token=e8kUPFUYLwmk422vXhMsmDkyIhfh7d2OOS7MkZy9pTv7BOKo-bD_u7zJltqIE4y_rENgic0E_c7oCCkOuLy45s8abvMeT0zg8o3Che_nX3VLtkulbYNN6psab5MkyJ_F1cvze5qrZBnmCL5FFBSQlqWG74C7_EFdl7TmvLiGhFYSZS1rECOuFYTiI-C7" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=duanxianpi/zotflow&type=date&legend=top-left&sealed_token=e8kUPFUYLwmk422vXhMsmDkyIhfh7d2OOS7MkZy9pTv7BOKo-bD_u7zJltqIE4y_rENgic0E_c7oCCkOuLy45s8abvMeT0zg8o3Che_nX3VLtkulbYNN6psab5MkyJ_F1cvze5qrZBnmCL5FFBSQlqWG74C7_EFdl7TmvLiGhFYSZS1rECOuFYTiI-C7" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=duanxianpi/zotflow&type=date&legend=top-left&sealed_token=e8kUPFUYLwmk422vXhMsmDkyIhfh7d2OOS7MkZy9pTv7BOKo-bD_u7zJltqIE4y_rENgic0E_c7oCCkOuLy45s8abvMeT0zg8o3Che_nX3VLtkulbYNN6psab5MkyJ_F1cvze5qrZBnmCL5FFBSQlqWG74C7_EFdl7TmvLiGhFYSZS1rECOuFYTiI-C7" />
+ </picture>
+</a>

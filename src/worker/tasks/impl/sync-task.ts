@@ -77,12 +77,26 @@ export class SyncTask extends BaseTask {
                     // Force content refresh: annotation/note changes do not
                     // bump the parent item's version, so the version-equality
                     // short-circuit in performUpdate would otherwise skip them.
-                    void this.taskManager.createBatchNoteTask(
-                        this.libraryNoteService,
-                        { items: resolved },
-                        { forceUpdateContent: true },
-                        true,
-                    );
+                    //
+                    // The catch is not optional: `void` on a promise attaches
+                    // no rejection handler, so a failure here would escape the
+                    // surrounding try/catch as an unhandled rejection rather
+                    // than being swallowed as intended.
+                    this.taskManager
+                        .createBatchNoteTask(
+                            this.libraryNoteService,
+                            { items: resolved },
+                            { forceUpdateContent: true },
+                            true,
+                        )
+                        .catch((spawnErr) =>
+                            this.log(
+                                "error",
+                                "Failed to spawn the post-sync source-note refresh",
+                                "SyncTask",
+                                spawnErr,
+                            ),
+                        );
                 }
             } catch (e) {
                 // Never let post-sync chaining fail the sync task itself.
@@ -141,8 +155,11 @@ export class SyncTask extends BaseTask {
                 depth++;
             }
 
-            // Skip if we still have a child-type item (orphan or cycle).
-            if (!item || CHILD_TYPES.has(item.itemType)) continue;
+            // Skip if we still have a child-type item (orphan or cycle), or if
+            // the resolved top-level item itself is in the Zotero trash. A
+            // trashed child may still resolve to a live parent, which should be
+            // refreshed so the removed child disappears from its source note.
+            if (!item || CHILD_TYPES.has(item.itemType) || item.trashed) continue;
 
             const dedupKey = `${libraryID}:${item.key}`;
             if (seen.has(dedupKey)) continue;

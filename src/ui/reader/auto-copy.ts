@@ -11,14 +11,8 @@ export interface AutoCopyContext {
     parentItemKey?: string;
     /** Library ID (for cloud attachments). Undefined for local files. */
     libraryID?: number;
-}
-
-/**
- * Returns true when the annotation was just created (not edited).
- */
-export function isNewlyCreated(annotation: AnnotationJSON): boolean {
-    const created = annotation.dateCreated ?? annotation.dateAdded;
-    return !!created && created === annotation.dateModified;
+    /** Key of the attachment the annotation was created on. Undefined for local files. */
+    attachmentKey?: string;
 }
 
 /**
@@ -70,6 +64,7 @@ export async function copyAnnotationOnCreate(
                         {
                             ...stripAnnotationForPayload(annotation),
                             libraryID: ctx.libraryID,
+                            parentItem: ctx.attachmentKey,
                         },
                     ],
                 },

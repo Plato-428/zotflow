@@ -1,16 +1,11 @@
-import { setIcon } from "obsidian";
 import { workerBridge } from "bridge";
 import { services } from "services/services";
 import { parseSearchQuery, splitHighlight } from "utils/search-query";
+import type { SearchResult } from "obsidian";
 import type { AnyIDBZoteroItem } from "types/db-schema";
 import type { SearchFilterField } from "utils/search-query";
 
 export type SuggestionItemFilter = (item: AnyIDBZoteroItem) => boolean;
-
-interface SearchHeader {
-    isHeader: true;
-    label: string;
-}
 
 interface SearchEmptyState {
     isEmpty: true;
@@ -22,13 +17,11 @@ export interface SearchValueCompletion {
     isValueCompletion: true;
     field: SearchFilterField;
     value: string;
+    match?: SearchResult;
 }
 
 export type SuggestionItem =
-    | AnyIDBZoteroItem
-    | SearchHeader
-    | SearchEmptyState
-    | SearchValueCompletion;
+    AnyIDBZoteroItem | SearchEmptyState | SearchValueCompletion;
 
 /**
  * Shared Zotero item search + rendering logic.
@@ -36,7 +29,21 @@ export type SuggestionItem =
  * to avoid duplicating query, rendering, and highlight code.
  */
 export class ZoteroItemSuggest {
+    /**
+     * Collection paths and display titles keyed `${libraryID}:${key}`. Lookups
+     * merge into them rather than replace them: an outdated lookup finishing
+     * late must not take away what the shown results render with.
+     */
     itemPaths: Record<string, string[]> = {};
+    /** Display titles, from the user's template. */
+    displayTitles: Record<string, string> = {};
+    /**
+     * Group labels ("Best Match", …), keyed by the first suggestion of their
+     * group. A label is drawn above that suggestion, not as a row of its own:
+     * a row would be one the list can select (the first row starts selected,
+     * so Enter would pick the label).
+     */
+    private groupLabels = new WeakMap<object, string>();
 
     constructor(private readonly itemFilter?: SuggestionItemFilter) {}
 
@@ -45,72 +52,52 @@ export class ZoteroItemSuggest {
         limit: number,
     ): Promise<SuggestionItem[]> {
         try {
-            let items: SuggestionItem[] = [];
+            let found: AnyIDBZoteroItem[] = [];
+            let label = "";
 
             if (!query) {
-                const recentItems =
-                    await workerBridge.dbHelper.getRecentItems(limit);
+                found = await workerBridge.search.getRecentItems(limit);
+                label = "Recent Viewed";
+                if (found.length === 0) {
+                    found =
+                        await workerBridge.search.getRecentlyAddedItems(limit);
+                    label = "Recently Added";
+                }
+            } else {
+                found = await workerBridge.search.searchItems(query, limit);
+                label = "Best Match";
+            }
 
-                if (recentItems.length > 0) {
-                    items = [
-                        { isHeader: true, label: "Recent Viewed" },
-                        ...recentItems,
-                    ];
+            const zItems = found.filter((item) => this.shouldIncludeItem(item));
+            const items: SuggestionItem[] = zItems;
+            if (zItems[0]) this.setGroupLabel(zItems[0], label);
+
+            if (zItems.length > 0) {
+                const refs = zItems.map((i) => ({
+                    libraryID: i.libraryID,
+                    key: i.key,
+                    collections: i.collections,
+                }));
+                const [paths, titles] = await Promise.allSettled([
+                    workerBridge.dbHelper.getItemPaths(refs),
+                    workerBridge.displayTitle.getTitles(refs),
+                ]);
+                if (paths.status === "fulfilled") {
+                    Object.assign(this.itemPaths, paths.value);
                 } else {
-                    const fallbackItems =
-                        await workerBridge.dbHelper.getRecentlyAddedItems(
-                            limit,
-                        );
-
-                    if (fallbackItems.length > 0) {
-                        items = [
-                            { isHeader: true, label: "Recently Added" },
-                            ...fallbackItems,
-                        ];
-                    }
-                }
-            } else {
-                const searchResults = await workerBridge.dbHelper.searchItems(
-                    query,
-                    limit,
-                );
-
-                if (searchResults.length > 0) {
-                    items = [
-                        { isHeader: true, label: "Best Match" },
-                        ...searchResults,
-                    ];
-                }
-            }
-
-            const zItems = items
-                .filter((i) => !("isHeader" in i) && !("isEmpty" in i))
-                .map((i) => i as AnyIDBZoteroItem)
-                .filter((item) => this.shouldIncludeItem(item));
-
-            if (zItems.length > 0) {
-                const firstHeader = items.find((i) => "isHeader" in i) as
-                    | SearchHeader
-                    | undefined;
-                items = [...(firstHeader ? [firstHeader] : []), ...zItems];
-            } else {
-                items = [];
-            }
-
-            if (zItems.length > 0) {
-                try {
-                    this.itemPaths = await workerBridge.dbHelper.getItemPaths(
-                        zItems.map((i) => ({
-                            libraryID: i.libraryID,
-                            key: i.key,
-                            collections: i.collections,
-                        })),
-                    );
-                } catch (pathErr) {
                     services.logService.error(
                         "Failed to fetch item paths",
                         "ZoteroItemSuggest",
-                        pathErr,
+                        paths.reason,
+                    );
+                }
+                if (titles.status === "fulfilled") {
+                    Object.assign(this.displayTitles, titles.value);
+                } else {
+                    services.logService.error(
+                        "Failed to fetch display titles",
+                        "ZoteroItemSuggest",
+                        titles.reason,
                     );
                 }
             }
@@ -142,17 +129,34 @@ export class ZoteroItemSuggest {
         return this.itemFilter ? this.itemFilter(item) : true;
     }
 
+    /** Show `label` above `item`, the first suggestion of its group. */
+    setGroupLabel(item: SuggestionItem, label: string): void {
+        this.groupLabels.set(item, label);
+    }
+
+    /**
+     * Draw the group label of `item`, if it starts a group, just before its
+     * row. Call it from every `renderSuggestion`, before the row's content.
+     */
+    renderGroupLabel(item: SuggestionItem, el: HTMLElement): void {
+        const label = this.groupLabels.get(item);
+        if (!label) return;
+        const labelEl = createDiv({
+            cls: "zotflow-suggestion-group-label",
+            text: label,
+        });
+        // Outside the row, so the row's selection highlight leaves it out.
+        // The list clears its container on every update, labels included.
+        if (el.parentElement) el.before(labelEl);
+        else el.prepend(labelEl);
+    }
+
     renderSuggestion(
         item: SuggestionItem,
         el: HTMLElement,
         query: string,
     ): void {
-        // Header
-        if ("isHeader" in item && item.isHeader) {
-            el.addClass("zotflow-suggestion-header");
-            el.setText(item.label);
-            return;
-        }
+        this.renderGroupLabel(item, el);
 
         // Empty state
         if ("isEmpty" in item && item.isEmpty) {
@@ -175,7 +179,10 @@ export class ZoteroItemSuggest {
         // Title Row
         const titleRow = contentContainer.createDiv({ cls: "zotflow-row-top" });
         const titleEl = titleRow.createDiv({ cls: "zotflow-title" });
-        this.renderHighlight(titleEl, zItem.title || "Untitled", query);
+        const title =
+            this.displayTitles[`${zItem.libraryID}:${zItem.key}`] ||
+            zItem.title;
+        this.renderHighlight(titleEl, title || "Untitled", query);
 
         // Meta + Path Row
         const bottomRow = contentContainer.createDiv({
@@ -185,7 +192,10 @@ export class ZoteroItemSuggest {
         // Author • Year
         const metaEl = bottomRow.createDiv({ cls: "zotflow-meta" });
         const authors = this.formatCreators(zItem.searchCreators);
-        const year = this.extractYear((zItem.raw.data as any).date);
+        // Only some Zotero item types carry `date`, so it is read off the
+        // union rather than assumed present.
+        const { date } = zItem.raw.data as { date?: string };
+        const year = this.extractYear(date ?? "");
 
         let metaText = "";
         if (authors && year !== "n.d.") metaText = `${authors} (${year}).`;

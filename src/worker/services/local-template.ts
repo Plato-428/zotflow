@@ -4,8 +4,31 @@ import type { ZotFlowSettings } from "settings/types";
 import type { AnnotationJSON } from "types/zotero-reader";
 import type { IParentProxy } from "bridge/types";
 import { ZotFlowError, ZotFlowErrorCode } from "utils/error";
+import { listToTabs } from "worker/convert/list-tabs";
+import { stripMarkdown } from "worker/convert/annotation-comment";
 import { getLocalSidecarPath } from "utils/utils";
+import { annoHtml2md } from "worker/convert";
 import type { AnnotationTemplateContext } from "types/template-context";
+import {
+    mandatoryKeyHint,
+    previewResult,
+    renderFragment,
+    renderLiquid,
+    renderTemplateFrontmatter,
+    splitFrontmatter,
+    strictFilterEngine,
+    zfEnv,
+    type LiquidFilterScope,
+} from "./liquid-support";
+import { describeTemplateScope } from "./template-variables";
+import type {
+    TemplatePreviewResult,
+    TemplateVariables,
+} from "types/template-preview";
+import {
+    mergeTemplateFrontmatter,
+    withMandatoryFirst,
+} from "utils/template-frontmatter";
 
 /** Default LiquidJS template string for local vault file source notes. */
 const DEFAULT_LOCAL_NOTE_TEMPLATE = `---
@@ -25,13 +48,11 @@ zotflow-local-attachment: [[{{ path }}]]
 {%- else -%}
 > > {{ annotation.text | replace: newline, quote_string_2 }}
 {%- endif -%}
-{%- if annotation.comment != "" -%}
 >
-> {{ annotation.comment | replace: newline, quote_string }}
-{%- endif -%}
+> {{ annotation.comment | wrap_editable: "ANNO", annotation.key | replace: newline, quote_string }}
 {%- if annotation.tags and annotation.tags.length > 0 -%}
 >
-> {% for t in annotation.tags %}#{{ t.tag | replace: " ", "\_" }}{% unless forloop.last %} {% endunless %}{% endfor %}
+> {% for t in annotation.tags %}#{{ t.tag | replace: " ", "_" }}{% unless forloop.last %} {% endunless %}{% endfor %}
 {%- endif -%}
 ^{{ annotation.key }}
 
@@ -40,8 +61,32 @@ zotflow-local-attachment: [[{{ path }}]]
 `;
 
 /** LiquidJS template engine for rendering local vault file (PDF/EPUB) source notes. */
+/** Root scope handed to Liquid when rendering a local-file sidecar note. */
+interface LocalRenderContext {
+    item: {
+        name: string;
+        path: string;
+        extension: string;
+        basename: string;
+        annotations: AnnotationTemplateContext[];
+    };
+    settings: ZotFlowSettings;
+    __zfReadOnlyKeys: Set<string>;
+}
+
+/** Options of the local source-note engine. */
+const ENGINE_OPTIONS = {
+    extname: ".md",
+    greedy: false,
+    globals: {
+        newline: "\n",
+    },
+};
+
 export class LocalTemplateService {
     private engine: Liquid;
+    /** The engine for previews: unknown filters are errors there (`strictFilterEngine`). */
+    private previewEngine: Liquid;
 
     constructor(
         private settings: ZotFlowSettings,
@@ -51,13 +96,7 @@ export class LocalTemplateService {
     }
 
     initialize() {
-        this.engine = new Liquid({
-            extname: ".md",
-            greedy: false,
-            globals: {
-                newline: "\n",
-            },
-        });
+        this.engine = new Liquid(ENGINE_OPTIONS);
 
         this.engine.registerFilter("process_nav_info", (input: string) => {
             const navInfo = {
@@ -65,6 +104,50 @@ export class LocalTemplateService {
             };
             return encodeURIComponent(JSON.stringify(navInfo));
         });
+
+        this.engine.registerFilter(
+            "wrap_editable",
+            /**
+             * Wrap content in ZF_<TYPE>_BEG/END markers so the CM6 editable
+             * region extension can mount an editable zone. Mirrors the
+             * library-template filter: consults the per-render
+             * `__zfReadOnlyKeys` set so read-only annotations (external,
+             * extracted from the PDF itself) render as plain locked text.
+             */
+            function (
+                this: LiquidFilterScope,
+                input: string,
+                type: string,
+                key: string,
+            ) {
+                if (!type || !key) return input;
+                const readOnlyKeys = zfEnv(this).__zfReadOnlyKeys;
+                if (readOnlyKeys && readOnlyKeys.has(`${type}:${key}`)) {
+                    return input;
+                }
+                // Always block form: markers on their own lines. An inline
+                // (single-line) layout was tried and retired — a line
+                // starting with `<!--` becomes a CommonMark HTML block, so
+                // markdown inside it renders raw in Reading view; `%%`
+                // markers avoid that but introduce stray blank lines.
+                return `<!-- ZF_${type}_BEG_${key} -->\n${input}\n<!-- ZF_${type}_END_${key} -->`;
+            },
+        );
+        this.engine.registerFilter("strip_markdown", (input: string) => {
+            if (!input) return "";
+            return stripMarkdown(input);
+        });
+        this.engine.registerFilter(
+            "list_tabs",
+            (input: string, indent?: string) => {
+                if (!input) return "";
+                return listToTabs(
+                    input,
+                    typeof indent === "string" ? indent : "\t",
+                );
+            },
+        );
+        this.previewEngine = strictFilterEngine(this.engine, ENGINE_OPTIONS);
     }
 
     updateSettings(newSettings: ZotFlowSettings) {
@@ -78,77 +161,17 @@ export class LocalTemplateService {
         localAttachment: TFileWithoutParentAndVault,
         annotations: AnnotationJSON[],
         templateContent: string | null,
-        originalFrontmatter: Record<string, any> = {},
+        originalFrontmatter: Record<string, unknown> = {},
     ): Promise<string> {
         try {
-            const context = await this.prepareLocalAttachmentContext(
+            const { text } = await this.renderSourceNote(
                 localAttachment,
                 annotations,
+                templateContent || DEFAULT_LOCAL_NOTE_TEMPLATE,
+                originalFrontmatter,
+                false,
             );
-
-            const template = templateContent || DEFAULT_LOCAL_NOTE_TEMPLATE;
-
-            // Separate Frontmatter and Body
-            const frontmatterRegex = /^---\s*([\s\S]*?)\s*---\n/;
-            const match = template.match(frontmatterRegex);
-
-            let templateFrontmatterRaw = "";
-            let body = template;
-
-            if (match) {
-                templateFrontmatterRaw = match[1] || "";
-                body = template.substring(match[0].length);
-            }
-
-            // Parse Template Frontmatter
-            let templateFrontmatter: any = {};
-            if (templateFrontmatterRaw.trim()) {
-                try {
-                    // Render the frontmatter raw string first (allow liquid tags in frontmatter)
-                    const renderedFrontmatterRaw =
-                        await this.engine.parseAndRender(
-                            templateFrontmatterRaw,
-                            context,
-                        );
-
-                    // Then parse the rendered string as YAML via Main Thread
-                    templateFrontmatter = await this.parentHost.parseYaml(
-                        renderedFrontmatterRaw,
-                    );
-                } catch (e) {
-                    this.parentHost.log(
-                        "error",
-                        "Failed to parse template frontmatter",
-                        "LocalTemplateService",
-                        e,
-                    );
-                    // Continue execution, just without template frontmatter
-                }
-            }
-
-            // Merge Frontmatter (Original + Rendered Template)
-            // Template keys overwrite Original keys
-            const finalFrontmatter = {
-                ...originalFrontmatter,
-                ...templateFrontmatter,
-            };
-
-            // Ensure Mandatory Fields
-            finalFrontmatter["zotflow-locked"] = true;
-            finalFrontmatter["zotflow-local-attachment"] =
-                `[[${localAttachment.path}]]`;
-
-            // Stringify Frontmatter via Main Thread
-            const frontmatterString =
-                await this.parentHost.stringifyYaml(finalFrontmatter);
-
-            // Render Body
-            const renderedBody = await this.engine.parseAndRender(
-                body,
-                context,
-            );
-
-            return `---\n${frontmatterString}---\n${renderedBody}`;
+            return text;
         } catch (err) {
             throw ZotFlowError.wrap(
                 err,
@@ -159,16 +182,70 @@ export class LocalTemplateService {
         }
     }
 
-    private sanitizeQuotesString(str: string | null | undefined): string {
-        if (!str) return "";
-        // Escape > into \> to prevent breaking blockquotes structure in Markdown
-        return str.replace(/>/g, "\\>");
+    /**
+     * The source-note render. `strict` (previews) reports frontmatter
+     * problems and positions Liquid errors in the whole template; a real
+     * render goes on without the template's frontmatter instead.
+     */
+    private async renderSourceNote(
+        localAttachment: TFileWithoutParentAndVault,
+        annotations: AnnotationJSON[],
+        template: string,
+        originalFrontmatter: Record<string, unknown>,
+        strict: boolean,
+    ): Promise<{
+        text: string;
+        frontmatter: Record<string, unknown>;
+        templateFrontmatter: Record<string, unknown>;
+        mandatory: Record<string, unknown>;
+    }> {
+        const context = await this.prepareLocalAttachmentContext(
+            localAttachment,
+            annotations,
+        );
+        const { frontmatter, body, bodyLine } = splitFrontmatter(template);
+
+        const templateFrontmatter = await renderTemplateFrontmatter({
+            engine: strict ? this.previewEngine : this.engine,
+            source: frontmatter,
+            scope: context,
+            parentHost: this.parentHost,
+            strict,
+            logContext: "LocalTemplateService",
+        });
+
+        // `??key` supplies a default without overwriting a value the user
+        // already has; bare keys retain overwrite-on-render semantics.
+        // Mandatory fields, always overwritten and written first.
+        const mandatory: Record<string, unknown> = {
+            "zotflow-locked": true,
+            "zotflow-local-attachment": `[[${localAttachment.path}]]`,
+        };
+        const finalFrontmatter = withMandatoryFirst(
+            mandatory,
+            mergeTemplateFrontmatter(originalFrontmatter, templateFrontmatter),
+        );
+
+        // Stringify Frontmatter via Main Thread
+        const frontmatterString =
+            await this.parentHost.stringifyYaml(finalFrontmatter);
+
+        const renderedBody = strict
+            ? await renderFragment(this.previewEngine, body, context, bodyLine)
+            : await renderLiquid(this.engine, body, context);
+
+        return {
+            text: `---\n${frontmatterString}---\n${renderedBody}`,
+            frontmatter: finalFrontmatter,
+            templateFrontmatter,
+            mandatory,
+        };
     }
 
     public async prepareLocalAttachmentContext(
         localAttachment: TFileWithoutParentAndVault,
         annotations: AnnotationJSON[],
-    ): Promise<any> {
+    ): Promise<LocalRenderContext> {
         const processedAnnotations: AnnotationTemplateContext[] = annotations
             .sort((a, b) =>
                 (a.sortIndex ?? "").localeCompare(b.sortIndex ?? ""),
@@ -179,8 +256,12 @@ export class LocalTemplateService {
                     libraryID: 0, // Local files imply simplified library context
                     type: annotation.type,
                     authorName: annotation.authorName,
-                    text: this.sanitizeQuotesString(annotation.text),
-                    comment: this.sanitizeQuotesString(annotation.comment),
+                    // Both fields carry Zotero's restricted annotation HTML
+                    // (<b>/<i>/<sub>/<sup>) — convert to markdown, escaping
+                    // stray </> on the way (annoHtml2md subsumes the old
+                    // sanitizeQuotesString).
+                    text: annoHtml2md(annotation.text || ""),
+                    comment: annoHtml2md(annotation.comment || ""),
                     color: annotation.color,
                     pageLabel: annotation.pageLabel,
                     tags:
@@ -206,6 +287,13 @@ export class LocalTemplateService {
             annotations: processedAnnotations,
         };
 
+        // Read-only annotations must not become editable regions —
+        // consumed by the wrap_editable filter.
+        const readOnlyKeys = new Set<string>();
+        for (const anno of processedAnnotations) {
+            if (anno.readOnly) readOnlyKeys.add(`ANNO:${anno.key}`);
+        }
+
         return {
             item,
             settings: {
@@ -213,16 +301,42 @@ export class LocalTemplateService {
                 annotationImageFolder:
                     this.settings.annotationImageFolder.replace(/\/$/, ""),
             },
+            __zfReadOnlyKeys: readOnlyKeys,
         };
     }
 
-    /** Preview-render a local vault file with the given template content. */
+    /**
+     * Preview a local source note for the template tester, as a new note. An
+     * empty template previews the built-in default, which is what an empty
+     * template path renders.
+     */
     async previewLocalNote(
         file: TFileWithoutParentAndVault,
         templateContent: string,
-    ): Promise<string> {
+    ): Promise<TemplatePreviewResult> {
         const annotations = await this.loadSidecarAnnotations(file);
-        return this.renderLocalNote(file, annotations, templateContent, {});
+        return previewResult(async (hints) => {
+            let template = templateContent;
+            if (!template.trim()) {
+                template = DEFAULT_LOCAL_NOTE_TEMPLATE;
+                hints.push("The template is empty; this is the built-in default template.");
+            }
+            const out = await this.renderSourceNote(file, annotations, template, {}, true);
+            const hint = mandatoryKeyHint(out.templateFrontmatter, out.mandatory);
+            if (hint) hints.push(hint);
+            return { output: out.text, frontmatter: out.frontmatter };
+        });
+    }
+
+    /** The variables a local source-note template sees for this file, for the template tester. */
+    async describeLocalNote(
+        file: TFileWithoutParentAndVault,
+    ): Promise<TemplateVariables> {
+        const annotations = await this.loadSidecarAnnotations(file);
+        return describeTemplateScope(
+            { ...(await this.prepareLocalAttachmentContext(file, annotations)) },
+            this.engine,
+        );
     }
 
     /** Load annotations from the co-located `.zf.json` sidecar file, if it exists. */
@@ -250,17 +364,8 @@ export class LocalTemplateService {
         }
     }
 
-    /** Return the user-configured template file content, or the built-in default. */
-    async getDefaultTemplate(): Promise<string> {
-        const path = this.settings.localSourceNoteTemplatePath;
-        if (path) {
-            try {
-                const content = await this.parentHost.readTextFile(path);
-                if (content != null) return content;
-            } catch {
-                // Fall through to default
-            }
-        }
+    /** The built-in local source-note template, used while no template file is set. */
+    getBuiltInTemplate(): string {
         return DEFAULT_LOCAL_NOTE_TEMPLATE;
     }
 }
